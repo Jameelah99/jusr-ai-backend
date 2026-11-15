@@ -1,13 +1,5 @@
-"""R-18: an overdue case needs a reason-for-delay code before it can move on."""
-from datetime import datetime, timezone
-from app.models.entities import Case, CaseStatus
+"""R-18: reason-for-delay codes. An OVERDUE case needs a follow-up with a code (A-10); a missed appointment does too (R-47)."""
+from app.models.entities import DelayReason
 
-def is_overdue(case: Case, now: datetime | None = None) -> bool:
-    now = now or datetime.now(timezone.utc)
-    return case.status != CaseStatus.CLOSED and case.due_at is not None and case.due_at < now
-
-def delay_reason_missing(case: Case, now: datetime | None = None) -> bool:
-    return is_overdue(case, now) and not case.delay_reason_code
-
-DELAY_REQUIRED = dict(status_code=422, code="DELAY_REASON_REQUIRED",
-                      message="This case is overdue; record a reason-for-delay code first (rule R-18)")
+def codes() -> list[str]:
+    return [r.value for r in DelayReason]

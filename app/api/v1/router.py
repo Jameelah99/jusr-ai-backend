@@ -1,6 +1,5 @@
 from fastapi import APIRouter
-from app.api.v1.endpoints import auth, patients, cases, worklist, dashboard, referrals, patient_links, tasks, ai, messages, urgent
-
+from app.api.v1.endpoints import auth, patients, cases, worklist, dashboard, referrals, patient_links, tasks, ai, messages, urgent, case_actions, consultations, events, settings_api, admin, measures, demo, routing_rules
 api_router = APIRouter()
 api_router.include_router(auth.router, prefix="/auth", tags=["Authentication"])
 api_router.include_router(patients.router, prefix="/patients", tags=["Patients"])
@@ -14,3 +13,11 @@ api_router.include_router(ai.router, prefix="/ai/suggestions", tags=["AI Suggest
 api_router.include_router(messages.router, prefix="/messages", tags=["Messages"])
 api_router.include_router(urgent.case_router, prefix="/cases", tags=["Urgent Routing"])
 api_router.include_router(urgent.router, prefix="/urgent-cases", tags=["Urgent Routing"])
+api_router.include_router(routing_rules.router, prefix="/routing-rules", tags=["Routing Rules"])
+api_router.include_router(case_actions.router, prefix="/cases", tags=["Case Actions"])
+api_router.include_router(consultations.router, prefix="/consultations", tags=["Consultations"])
+api_router.include_router(events.router, prefix="/events", tags=["Events"])
+api_router.include_router(settings_api.router, prefix="/settings", tags=["Settings"])
+api_router.include_router(admin.router, prefix="/admin", tags=["Administration"])
+api_router.include_router(measures.router, prefix="/measures", tags=["Measures"])
+api_router.include_router(demo.router, prefix="/demo", tags=["Demo"])

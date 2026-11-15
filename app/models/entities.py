@@ -1,4 +1,5 @@
 import enum
+from app.core import clock
 import uuid
 from datetime import datetime, timezone
 from sqlalchemy import String, Boolean, DateTime, ForeignKey, Integer, Float, Text, Enum, JSON, false, event
@@ -9,6 +10,9 @@ from app.core import audit_guard
 
 def uid():
     return str(uuid.uuid4())
+
+def _now():
+    return clock.now()  # the demo clock (R-66), so backdated demo data and stored timestamps agree
 
 class UTCDateTime(TypeDecorator):
     """Timezone-aware UTC datetime on every backend.
@@ -47,29 +51,72 @@ class Role(str, enum.Enum):
     AI_SERVICE = "AI_SERVICE"
 
 class CaseStatus(str, enum.Enum):
-    OPEN = "OPEN"
-    ASSIGNED = "ASSIGNED"
-    REFERRED = "REFERRED"
-    IN_PROGRESS = "IN_PROGRESS"
-    RESOLVED = "RESOLVED"
+    """Developer Guide Part 1, section 3. One status per case; flags say what needs attention."""
+    NEW = "NEW"
+    AWAITING_CLASSIFICATION = "AWAITING_CLASSIFICATION"
+    URGENT_ROUTING = "URGENT_ROUTING"
+    NOTIFYING = "NOTIFYING"
+    AWAITING_ACK = "AWAITING_ACK"
+    AWAITING_CONFIRMATION = "AWAITING_CONFIRMATION"
+    REFERRAL_PENDING = "REFERRAL_PENDING"
+    AWAITING_APPOINTMENT = "AWAITING_APPOINTMENT"
+    AWAITING_TREATMENT = "AWAITING_TREATMENT"
+    READY_TO_CLOSE = "READY_TO_CLOSE"
     CLOSED = "CLOSED"
 
 class ReferralStatus(str, enum.Enum):
-    PENDING = "PENDING"
+    SENT = "SENT"
     ACCEPTED = "ACCEPTED"
-    REJECTED = "REJECTED"
-    CANCELLED = "CANCELLED"
+    DECLINED = "DECLINED"
+    NOT_ACCEPTED_IN_TIME = "NOT_ACCEPTED_IN_TIME"
+
+class DeclineCode(str, enum.Enum):
+    """R-44: declining a referral needs a reason from this list."""
+    WRONG_SPECIALTY = "WRONG_SPECIALTY"
+    NO_CAPACITY = "NO_CAPACITY"
+    INFORMATION_MISSING = "INFORMATION_MISSING"
+    NOT_ELIGIBLE = "NOT_ELIGIBLE"
+    OTHER = "OTHER"
 
 class DelayReason(str, enum.Enum):
-    """R-18 reason-for-delay codes (proposed set; confirm with the Developer Guide)."""
+    """R-18 reason-for-delay codes (Developer Guide Part 1)."""
     PATIENT_UNREACHABLE = "PATIENT_UNREACHABLE"
-    PATIENT_DECLINED = "PATIENT_DECLINED"
-    AWAITING_RESULTS = "AWAITING_RESULTS"
-    AWAITING_REFERRAL_RESPONSE = "AWAITING_REFERRAL_RESPONSE"
-    TRANSPORT_OR_ACCESS = "TRANSPORT_OR_ACCESS"
-    STAFF_CAPACITY = "STAFF_CAPACITY"
-    FACILITY_CAPACITY = "FACILITY_CAPACITY"
+    PATIENT_DID_NOT_UNDERSTAND = "PATIENT_DID_NOT_UNDERSTAND"
+    REFERRAL_DECLINED = "REFERRAL_DECLINED"
+    NO_SLOT_AVAILABLE = "NO_SLOT_AVAILABLE"
+    RESULT_OR_DATA_MISSING = "RESULT_OR_DATA_MISSING"
+    PATIENT_MOVED = "PATIENT_MOVED"
     OTHER = "OTHER"
+
+class ClosureType(str, enum.Enum):
+    CARE_CONFIRMED = "CARE_CONFIRMED"
+    NOT_ACTIONABLE = "NOT_ACTIONABLE"
+    NO_FURTHER_CARE = "NO_FURTHER_CARE"
+    PATIENT_DECLINED = "PATIENT_DECLINED"
+    UNREACHABLE = "UNREACHABLE"
+    MOVED_OR_TRANSFERRED = "MOVED_OR_TRANSFERRED"
+    OTHER = "OTHER"
+
+class ConsultationType(str, enum.Enum):
+    PATIENT_CALLBACK = "PATIENT_CALLBACK"
+    CLINICIAN_TO_CLINICIAN = "CLINICIAN_TO_CLINICIAN"
+
+class ConsultationState(str, enum.Enum):
+    REQUESTED = "REQUESTED"
+    ACCEPTED = "ACCEPTED"
+    OUTCOME_RECORDED = "OUTCOME_RECORDED"
+    ESCALATED = "ESCALATED"
+
+class ConsultationOutcomeType(str, enum.Enum):
+    ADVICE_GIVEN = "ADVICE_GIVEN"
+    TEST_ORDERED = "TEST_ORDERED"
+    REFERRAL_MADE = "REFERRAL_MADE"
+    NO_ACTION = "NO_ACTION"
+
+class Attendance(str, enum.Enum):
+    BOOKED = "BOOKED"
+    ATTENDED = "ATTENDED"
+    MISSED = "MISSED"
 
 class LinkStatus(str, enum.Enum):
     ACTIVE = "ACTIVE"
@@ -116,13 +163,21 @@ class User(Base):
     role: Mapped[Role] = mapped_column(Enum(Role), default=Role.COORDINATOR)
     facility_id: Mapped[str | None] = mapped_column(ForeignKey("facilities.id"), nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
-    specialty: Mapped[str | None] = mapped_column(String(60), nullable=True)  # receiving clinicians; matched against a case's required specialty
+    specialty: Mapped[str | None] = mapped_column(String(60), nullable=True)  # matched against a case's required specialty
+    authorised_to_close: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
 
 class Facility(Base):
     __tablename__ = "facilities"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
     name: Mapped[str] = mapped_column(String(200))
     code: Mapped[str] = mapped_column(String(40), unique=True)
+    facility_type: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    connector_type: Mapped[str | None] = mapped_column(String(30), nullable=True)  # FEED_SIMULATOR or CSV
+    connection_status: Mapped[str] = mapped_column(String(20), default="NOT_CONNECTED", server_default="NOT_CONNECTED")
+    time_zone: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    working_days: Mapped[list | None] = mapped_column(JSON, nullable=True)  # e.g. ["MON","TUE",...]
+    last_event_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
+    created_by_id: Mapped[str | None] = mapped_column(String(36), nullable=True)  # the administrator who added the facility (A-11)
 
 class Patient(Base):
     __tablename__ = "patients"
@@ -134,6 +189,8 @@ class Patient(Base):
     data_origin: Mapped[str] = mapped_column(String(30), default="SYNTHETIC")
     facility_id: Mapped[str | None] = mapped_column(ForeignKey("facilities.id"), nullable=True)
     birth_year: Mapped[int | None] = mapped_column(Integer, nullable=True)  # used only to verify patient secure links; never returned by staff APIs
+    record_number: Mapped[str | None] = mapped_column(String(60), nullable=True, index=True)  # facility record number, a patient-match identifier
+    preferred_language: Mapped[str] = mapped_column(String(10), default="en", server_default="en")
 
 class Screening(Base):
     __tablename__ = "screenings"
@@ -152,7 +209,20 @@ class Case(Base):
     facility_id: Mapped[str] = mapped_column(ForeignKey("facilities.id"))
     coordinator_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
     priority: Mapped[Priority] = mapped_column(Enum(Priority), default=Priority.NORMAL)
-    status: Mapped[CaseStatus] = mapped_column(Enum(CaseStatus), default=CaseStatus.OPEN)
+    status: Mapped[CaseStatus] = mapped_column(Enum(CaseStatus, native_enum=False, length=30), default=CaseStatus.NEW)
+    tracker_id: Mapped[str | None] = mapped_column(String(20), unique=True, nullable=True, index=True)  # R-20, created at T2
+    status_entered_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
+    confirmatory_required: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
+    match_confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    match_confirmed_by_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    flag_overdue: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
+    flag_exception: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
+    flag_data_missing: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
+    flag_message_failed: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
+    flag_not_explained: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
+    closure_type: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    closed_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
+    linked_case_id: Mapped[str | None] = mapped_column(ForeignKey("cases.id"), nullable=True)  # R-56: a new case linked to a closed one
     next_action_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
     next_action_label: Mapped[str | None] = mapped_column(String(200), nullable=True)
     due_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
@@ -172,14 +242,18 @@ class Case(Base):
     routing_accepted_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
     routing_exception_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     routing_tried: Mapped[list | None] = mapped_column(JSON, nullable=True)  # clinician ids already offered the case
-    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=lambda: datetime.now(timezone.utc))
-    updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=_now, onupdate=_now)
 
 class Referral(Base):
     __tablename__ = "referrals"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
     case_id: Mapped[str] = mapped_column(ForeignKey("cases.id"))
-    status: Mapped[str] = mapped_column(String(30), default="PENDING")
+    status: Mapped[str] = mapped_column(String(30), default=ReferralStatus.SENT.value)
+    target_specialty: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    packet: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    accepted_by_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    decline_code: Mapped[str | None] = mapped_column(String(30), nullable=True)
     receiving_facility_id: Mapped[str | None] = mapped_column(ForeignKey("facilities.id"), nullable=True)
     receiving_clinician_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
     referred_by_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
@@ -189,17 +263,35 @@ class Referral(Base):
     escalation_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     escalated_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
     decided_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=lambda: datetime.now(timezone.utc))
-    updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=_now, onupdate=_now)
 
 class Consultation(Base):
+    """A child object of the case with its own states (R-11). It never changes the case status."""
     __tablename__ = "consultations"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
-    case_id: Mapped[str] = mapped_column(ForeignKey("cases.id"))
-    clinician_id: Mapped[str] = mapped_column(ForeignKey("users.id"))
+    case_id: Mapped[str] = mapped_column(ForeignKey("cases.id"), index=True)
+    type: Mapped[str] = mapped_column(String(30), default=ConsultationType.CLINICIAN_TO_CLINICIAN.value)
+    state: Mapped[str] = mapped_column(String(20), default=ConsultationState.REQUESTED.value, index=True)
+    source: Mapped[str] = mapped_column(String(20), default="STAFF")  # STAFF or PATIENT_LINK
+    requester_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    recipient_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    recipient_specialty: Mapped[str | None] = mapped_column(String(60), nullable=True)
     referral_id: Mapped[str | None] = mapped_column(ForeignKey("referrals.id"), nullable=True)
-    notes: Mapped[str] = mapped_column(Text)
-    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=lambda: datetime.now(timezone.utc))
+    question: Mapped[str | None] = mapped_column(Text, nullable=True)
+    preferred_time: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    thread: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    urgent: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
+    due_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
+    escalation_stage: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    accepted_by_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    accepted_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
+    outcome_type: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    outcome_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    outcome_by_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    outcome_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
+    escalated_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=_now)
 
 class AuditEvent(Base):
     __tablename__ = "audit_events"
@@ -212,11 +304,8 @@ class AuditEvent(Base):
     old_values: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     new_values: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     request_id: Mapped[str | None] = mapped_column(String(80), nullable=True)
-    occurred_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=lambda: datetime.now(timezone.utc))
+    occurred_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=_now)
 
-
-def _now():
-    return datetime.now(timezone.utc)
 
 class PatientLink(Base):
     """Secure patient link. Only a SHA-256 hash of the random token is stored."""
@@ -290,6 +379,9 @@ class Message(Base):
     case_id: Mapped[str] = mapped_column(ForeignKey("cases.id"), index=True)
     facility_id: Mapped[str] = mapped_column(ForeignKey("facilities.id"))
     channel: Mapped[str] = mapped_column(String(20))
+    kind: Mapped[str] = mapped_column(String(40), default="RESULT_NOTICE", server_default="RESULT_NOTICE")
+    language: Mapped[str] = mapped_column(String(10), default="en", server_default="en")
+    template_version: Mapped[str] = mapped_column(String(20), default="v1", server_default="v1")
     body: Mapped[str] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(20), default=MessageStatus.DRAFT.value)
     source: Mapped[str] = mapped_column(String(20), default="STAFF")
@@ -304,6 +396,128 @@ class Message(Base):
     sent_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=_now)
     updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=_now, onupdate=_now)
+
+
+class Setting(Base):
+    """R-23: one store for time limits, routing rules, reminder schedules; scoped global, facility or specialty."""
+    __tablename__ = "settings"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    key: Mapped[str] = mapped_column(String(100), index=True)
+    scope: Mapped[str] = mapped_column(String(100), default="global")  # "global", "facility:<id>" or "specialty:<NAME>"
+    value: Mapped[dict | list | int | float | str | None] = mapped_column(JSON)
+    changed_by_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    changed_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=_now)
+
+class DelayFollowup(Base):
+    """R-18: staff follow-up with a reason-for-delay code on an OVERDUE case or a missed appointment."""
+    __tablename__ = "delay_followups"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    case_id: Mapped[str] = mapped_column(ForeignKey("cases.id"), index=True)
+    flag: Mapped[str] = mapped_column(String(30))  # OVERDUE or MISSED_APPOINTMENT
+    status: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    code: Mapped[str] = mapped_column(String(40))
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    staff_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=_now)
+
+class Result(Base):
+    """Original and confirmatory results are both stored."""
+    __tablename__ = "results"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    case_id: Mapped[str] = mapped_column(ForeignKey("cases.id"), index=True)
+    facility_id: Mapped[str | None] = mapped_column(ForeignKey("facilities.id"), nullable=True)
+    kind: Mapped[str] = mapped_column(String(20), default="ORIGINAL")  # ORIGINAL or CONFIRMATORY
+    test_code: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    test_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    value: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    abnormal: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
+    issued_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
+    source: Mapped[str] = mapped_column(String(30), default="MANUAL")  # FEED, UPLOAD, MANUAL
+    event_id: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    received_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=_now)
+
+class Appointment(Base):
+    __tablename__ = "appointments"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    case_id: Mapped[str] = mapped_column(ForeignKey("cases.id"), index=True)
+    facility_id: Mapped[str | None] = mapped_column(ForeignKey("facilities.id"), nullable=True)
+    scheduled_at: Mapped[datetime] = mapped_column(UTCDateTime())
+    attendance: Mapped[str] = mapped_column(String(20), default=Attendance.BOOKED.value)
+    recorded_by_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    recorded_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=_now)
+
+class TreatmentStart(Base):
+    """Evidence for T15 (R-48): a start date and a note or attachment."""
+    __tablename__ = "treatment_starts"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    case_id: Mapped[str] = mapped_column(ForeignKey("cases.id"), index=True)
+    kind: Mapped[str] = mapped_column(String(20))  # TREATMENT or MONITORING
+    start_date: Mapped[datetime] = mapped_column(UTCDateTime())
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    attachment_ref: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    recorded_by_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    recorded_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=_now)
+
+class ContactAttempt(Base):
+    """Logged attempts to reach a patient, by route (R-55) and the staff confirmation that clears MESSAGE_FAILED."""
+    __tablename__ = "contact_attempts"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    case_id: Mapped[str] = mapped_column(ForeignKey("cases.id"), index=True)
+    route: Mapped[str] = mapped_column(String(20))  # PHONE, SMS, EMAIL, VISIT, OTHER
+    outcome: Mapped[str] = mapped_column(String(20))  # REACHED or NOT_REACHED
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    recorded_by_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=_now)
+
+class Closure(Base):
+    """Closure record (section 10). status PENDING_SIGNOFF holds an 'Other' closure until a second authorised person approves (R-54)."""
+    __tablename__ = "closures"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    case_id: Mapped[str] = mapped_column(ForeignKey("cases.id"), index=True)
+    closure_type: Mapped[str] = mapped_column(String(30))
+    status: Mapped[str] = mapped_column(String(20), default="CLOSED")  # PENDING_SIGNOFF or CLOSED
+    reason: Mapped[str] = mapped_column(Text)
+    decision: Mapped[str | None] = mapped_column(Text, nullable=True)
+    evidence: Mapped[str | None] = mapped_column(Text, nullable=True)
+    closed_by_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    second_signoff_by_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    transition_id: Mapped[str | None] = mapped_column(String(4), nullable=True)
+    requested_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=_now)
+    closed_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
+
+class InboundEvent(Base):
+    """An event received by a connector (section 5). The event id makes receipt idempotent (R-24)."""
+    __tablename__ = "inbound_events"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    event_id: Mapped[str] = mapped_column(String(80), index=True)
+    type: Mapped[str] = mapped_column(String(40))
+    facility_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    status: Mapped[str] = mapped_column(String(20))  # ACCEPTED, REJECTED, DUPLICATE
+    error_code: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    payload: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    case_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    received_by_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    received_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=_now)
+
+
+class RoutingRule(Base):
+    """R-27: routing and urgency criteria are data, not code. One row per pathway and result category. Placeholder content, not clinical guidance."""
+    __tablename__ = "routing_rules"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    pathway: Mapped[str] = mapped_column(String(100))
+    result_category: Mapped[str] = mapped_column(String(200))
+    suggested_urgency: Mapped[str | None] = mapped_column(String(20), nullable=True)  # a suggestion only; a person sets urgency (R-28a)
+    confirmatory_required: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
+    specialty: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    primary_pool: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    backup_pool: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    time_to_accept_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    time_to_appointment_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    changed_by_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    changed_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=_now)
 
 
 # ---- R-21: audit events are append-only ----

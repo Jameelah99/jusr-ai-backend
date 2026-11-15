@@ -17,7 +17,7 @@ def upgrade():
             for role in NEW_ROLES:
                 op.execute(f"ALTER TYPE role ADD VALUE IF NOT EXISTS '{role}'")
     # Old name for the coordinator role.
-    # op.execute("UPDATE users SET role = 'COORDINATOR' WHERE role = 'FACILITY_STAFF'")
+    op.execute("UPDATE users SET role = 'COORDINATOR' WHERE role = 'FACILITY_STAFF'")
     columns = [c["name"] for c in sa.inspect(bind).get_columns("patients")]
     if "facility_id" not in columns:
         # SQLite cannot add a foreign-key constraint with ADD COLUMN; it is enforced on PostgreSQL only.

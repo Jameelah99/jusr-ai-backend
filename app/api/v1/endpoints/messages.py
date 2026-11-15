@@ -1,6 +1,6 @@
-from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
+from app.core import clock
 from app.core.database import get_db
 from app.core.permissions import CREATE_ROLES, can_modify_case, can_view_case, visible_cases
 from app.api.v1.deps import clinical_user
@@ -11,8 +11,11 @@ from app.services.messaging import attempt_delivery, get_message_provider, proce
 
 router = APIRouter()
 
+# R-28: a coordinator approves and sends patient messages (Part 1 matrix); clinicians do not.
+MESSAGE_ROLES = (Role.COORDINATOR, Role.NATIONAL_ADMIN)
+
 def message_out(m: Message) -> dict:
-    return {"id": m.id, "caseId": m.case_id, "channel": m.channel, "body": m.body, "status": m.status, "source": m.source, "suggestionId": m.suggestion_id,
+    return {"id": m.id, "caseId": m.case_id, "channel": m.channel, "kind": m.kind, "language": m.language, "templateVersion": m.template_version, "body": m.body, "status": m.status, "source": m.source, "suggestionId": m.suggestion_id,
             "createdById": m.created_by_id, "approvedById": m.approved_by_id, "approvedAt": m.approved_at, "rejectionReason": m.rejection_reason,
             "attempts": m.attempts, "nextRetryAt": m.next_retry_at, "lastError": m.last_error, "sentAt": m.sent_at, "createdAt": m.created_at}
 
@@ -20,7 +23,7 @@ def _load(db, user, message_id, *, modify) -> tuple[Message, Case]:
     row = visible_cases(db.query(Message, Case).join(Case, Message.case_id == Case.id), user).filter(Message.id == message_id).first()
     if not row: raise HTTPException(404, "Message not found")
     m, case = row
-    if modify and (user.role not in CREATE_ROLES or not can_modify_case(user, case)): raise HTTPException(403, "Insufficient permissions")
+    if modify and (user.role not in MESSAGE_ROLES or not can_modify_case(user, case)): raise HTTPException(403, "Insufficient permissions")
     return m, case
 
 @router.get("")
@@ -37,8 +40,10 @@ def list_messages(page: int = Query(1, ge=1), pageSize: int = Query(20, ge=1, le
 def create_message(payload: MessageCreate, db: Session = Depends(get_db), user=Depends(clinical_user)):
     case = db.query(Case).filter((Case.id == payload.caseId) | (Case.case_number == payload.caseId)).first()
     if not case or not can_view_case(user, case, db): raise HTTPException(404, "Case not found")
-    if user.role not in CREATE_ROLES or not can_modify_case(user, case): raise HTTPException(403, "Insufficient permissions")
-    m = Message(case_id=case.id, facility_id=case.facility_id, channel=payload.channel, body=payload.body, source="STAFF", created_by_id=user.id)
+    if user.role not in MESSAGE_ROLES or not can_modify_case(user, case): raise HTTPException(403, "Insufficient permissions")
+    kind = payload.kind or ("RESULT_NOTICE_URGENT" if case.priority.value == "URGENT" else "RESULT_NOTICE_ROUTINE")
+    m = Message(case_id=case.id, facility_id=case.facility_id, channel=payload.channel, kind=kind, language=payload.language, template_version=payload.templateVersion,
+                body=payload.body, source="STAFF", created_by_id=user.id)
     db.add(m); db.flush()
     record_event(db, user, case_id=case.id, event_type="MESSAGE_DRAFTED", description="Message drafted", new_values={"messageId": m.id, "channel": m.channel})
     db.commit()
@@ -65,9 +70,9 @@ def approve_message(message_id: str, payload: MessageApprove | None = None, db: 
     edited = payload.editedBody if payload else None
     old = m.body
     if edited: m.body = edited
-    m.status = MessageStatus.APPROVED.value; m.approved_by_id = user.id; m.approved_at = datetime.now(timezone.utc)
+    m.status = MessageStatus.APPROVED.value; m.approved_by_id = user.id; m.approved_at = clock.now()
     record_event(db, user, case_id=case.id, event_type="MESSAGE_APPROVED", description="Message approved for sending",
-                 new_values={"messageId": m.id, "edited": bool(edited and edited != old)})
+                 new_values={"messageId": m.id, "edited": bool(edited and edited != old), "templateVersion": m.template_version, "kind": m.kind})
     db.commit()
     return {"success": True, "data": message_out(m), "meta": {}}
 

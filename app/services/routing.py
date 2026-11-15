@@ -7,20 +7,25 @@ An URGENT case is routed to a receiving clinician whose specialty matches the ca
   EXCEPTION  no qualified clinician exists, or the backup also let the limit pass; the coordinator must act
 Every step writes an audit event.
 """
-from datetime import datetime, timedelta, timezone
-from types import SimpleNamespace
+from datetime import timedelta
 from fastapi import HTTPException
-from app.core.config import settings
+from app.core import clock
 from app.models.entities import Case, CaseStatus, Priority, Role, RoutingStatus, Task, User
+from app.services import settings_store
 from app.services.audit import record_event, reject_and_log
 from app.services.tasks import create_task
 
 # Actor for work done by the scheduler: no user id, role SYSTEM.
-SYSTEM_ACTOR = SimpleNamespace(id=None, role=SimpleNamespace(value="SYSTEM"))
+from app.services.state_machine import SYSTEM as SYSTEM_ACTOR
 ROUTING_TASKS = ("URGENT_ROUTING_ESCALATED", "URGENT_ROUTING_EXCEPTION")
 
 def _now():
-    return datetime.now(timezone.utc)
+    return clock.now()
+
+def default_limits(db, case, specialty=None):
+    spec = specialty or case.required_specialty
+    return (settings_store.get_int(db, "urgent.acceptance_minutes", facility_id=case.facility_id, specialty=spec),
+            settings_store.get_int(db, "urgent.escalation_minutes", facility_id=case.facility_id, specialty=spec))
 
 def normalize_specialty(value: str | None) -> str | None:
     return "_".join(value.strip().upper().split()) if value and value.strip() else None
@@ -63,7 +68,7 @@ def summary(db, case: Case) -> dict | None:
 def _enter_exception(db, actor, case: Case, reason: str, now) -> None:
     previous = case.routed_clinician_id
     case.routing_status = RoutingStatus.EXCEPTION.value; case.routed_clinician_id = None; case.routing_due_at = None
-    case.routing_exception_reason = reason
+    case.routing_exception_reason = reason; case.flag_exception = True
     create_task(db, case, "URGENT_ROUTING_EXCEPTION", "Urgent case has no clinician to accept it", reason, source_ref=case.id)
     record_event(db, actor, case_id=case.id, event_type="URGENT_ROUTING_EXCEPTION", description="Urgent routing exception",
                  old_values={"routedClinicianId": previous}, new_values={"status": case.routing_status, "reason": reason, "requiredSpecialty": case.required_specialty})
@@ -74,6 +79,9 @@ def route_case(db, actor, case: Case, *, clinician_id=None, specialty=None, firs
         reject_and_log(db, actor, case_id=case.id, attempted="routing:route", status_code=409, code="CASE_NOT_URGENT", message="Only an URGENT case can be routed for urgent acceptance")
     if case.status == CaseStatus.CLOSED:
         reject_and_log(db, actor, case_id=case.id, attempted="routing:route", status_code=409, code="CASE_CLOSED", message="Cannot route a closed case")
+    if case.status != CaseStatus.URGENT_ROUTING:
+        reject_and_log(db, actor, case_id=case.id, attempted="routing:route", status_code=409, code="INVALID_STATUS_TRANSITION",
+                       message=f"Urgent routing starts when a clinician marks the case urgent (T4); the case is {case.status.value}")
     if case.routing_status in (RoutingStatus.AWAITING_ACCEPTANCE.value, RoutingStatus.ACCEPTED.value):
         reject_and_log(db, actor, case_id=case.id, attempted="routing:route", status_code=409, code="ROUTING_ALREADY_ACTIVE", message=f"Routing is already {case.routing_status}")
     required = normalize_specialty(specialty) or case.required_specialty
@@ -84,8 +92,9 @@ def route_case(db, actor, case: Case, *, clinician_id=None, specialty=None, firs
         found = qualified_clinicians(db, required, prefer_facility=case.facility_id)
         clinician = found[0] if found else None
     case.required_specialty = required
-    case.routing_first_limit_minutes = first_limit or settings.urgent_acceptance_minutes
-    case.routing_second_limit_minutes = second_limit or settings.urgent_escalation_minutes
+    d1, d2 = default_limits(db, case, required)
+    case.routing_first_limit_minutes = first_limit or d1
+    case.routing_second_limit_minutes = second_limit or d2
     case.routing_started_at = now; case.routing_stage = 0; case.routing_accepted_at = None; case.routing_exception_reason = None
     case.routing_tried = [clinician.id] if clinician else []
     case.updated_at = now
@@ -110,7 +119,7 @@ def reassign_case(db, actor, case: Case, *, clinician_id: str, reason: str) -> C
     case.routing_tried = sorted(set(case.routing_tried or []) | {clinician.id})
     case.routed_clinician_id = clinician.id; case.routing_status = RoutingStatus.AWAITING_ACCEPTANCE.value
     case.routing_stage = 0; case.routing_exception_reason = None; case.updated_at = now
-    case.routing_due_at = now + timedelta(minutes=case.routing_first_limit_minutes or settings.urgent_acceptance_minutes)
+    case.routing_due_at = now + timedelta(minutes=case.routing_first_limit_minutes or default_limits(db, case)[0])
     _close_routing_tasks(db, case, now)
     record_event(db, actor, case_id=case.id, event_type="URGENT_ROUTING_REASSIGNED", description="Urgent routing reassigned by staff",
                  old_values={"routedClinicianId": previous}, new_values={"routedClinicianId": clinician.id, "reason": reason, "dueAt": case.routing_due_at.isoformat()})
@@ -120,13 +129,14 @@ def accept_case(db, user, case: Case) -> Case:
     now = _now()
     if case.routing_status != RoutingStatus.AWAITING_ACCEPTANCE.value:
         reject_and_log(db, user, case_id=case.id, attempted="routing:accept", status_code=409, code="INVALID_ROUTING_STATE", message=f"Cannot accept: routing is {case.routing_status or 'not started'}")
-    if user.specialty != case.required_specialty:
-        reject_and_log(db, user, case_id=case.id, attempted="routing:accept", status_code=403, code="SPECIALTY_MISMATCH",
-                       message=f"Your specialty {user.specialty or 'none'} does not match the required specialty {case.required_specialty}")
-    case.routing_status = RoutingStatus.ACCEPTED.value; case.routing_accepted_at = now; case.routing_due_at = None; case.updated_at = now
+    from app.services import state_machine as sm
+    stage = case.routing_stage
+    sm.apply(db, user, case, "T5", ctx={"clinician": user}, at=now, flags={"exception": False},
+             details={"routedClinicianId": user.id, "stage": stage, "requiredSpecialty": case.required_specialty})
+    case.routing_status = RoutingStatus.ACCEPTED.value; case.routing_accepted_at = now; case.routing_due_at = None
     _close_routing_tasks(db, case, now)
-    record_event(db, user, case_id=case.id, event_type="URGENT_CASE_ACCEPTED", description="Urgent case accepted by the receiving clinician",
-                 new_values={"routedClinicianId": user.id, "stage": case.routing_stage, "acceptedAt": now.isoformat()})
+    record_event(db, user, case_id=case.id, event_type="URGENT_CASE_ACCEPTED", description="Urgent case accepted by the receiving clinician", at=now,
+                 new_values={"routedClinicianId": user.id, "stage": stage, "acceptedAt": now.isoformat()})
     return case
 
 def process_due_routing(db, actor, case_query=None, now=None) -> dict:
@@ -137,9 +147,11 @@ def process_due_routing(db, actor, case_query=None, now=None) -> dict:
     counts = {"processed": 0, "escalated": 0, "reassigned": 0, "exceptions": 0}
     for case in due:
         counts["processed"] += 1
-        first = case.routing_first_limit_minutes or settings.urgent_acceptance_minutes
-        second = case.routing_second_limit_minutes or settings.urgent_escalation_minutes
+        d1, d2 = default_limits(db, case)
+        first = case.routing_first_limit_minutes or d1
+        second = case.routing_second_limit_minutes or d2
         if case.routing_stage == 0:
+            case.flag_exception = True  # R-13: not accepted in time is an EXCEPTION, escalated to the coordinator
             case.routing_stage = 1; case.routing_due_at = now + timedelta(minutes=second); case.updated_at = now
             create_task(db, case, "URGENT_ROUTING_ESCALATED", "Urgent case not accepted within the time limit",
                         f"Routed clinician has not accepted. Reassign it, or it goes to a backup clinician at {case.routing_due_at.isoformat()}.", source_ref=case.id)

@@ -20,11 +20,17 @@ class UrgencyPayload(BaseModel):
     priority: Priority
     actionability: Literal["ACTIONABLE", "NEEDS_REVIEW", "NOT_ACTIONABLE"]
     rationale: RequiredText
+    specialtyNeeded: str | None = Field(default=None, max_length=60)
+    confirmatoryTestRequired: bool | None = None
+    sourceFields: dict = Field(default_factory=dict)
+
 
 class MessageDraftPayload(BaseModel):
     channel: Literal["SMS", "EMAIL"]
     body: Body2000
     purpose: str | None = Field(default=None, max_length=200)
+    language: Literal["en", "ar"] = "en"
+    templateVersion: str = Field(default="v1", max_length=20)
 
 class Citation(BaseModel):
     sourceType: Literal["CASE", "SCREENING", "AUDIT_EVENT", "REFERRAL", "CONSULTATION", "PATIENT_RESPONSE"]
@@ -63,13 +69,25 @@ class SuggestionReject(BaseModel):
     reason: RequiredText
 
 # ---- messages ----
+MESSAGE_KINDS = ("RESULT_NOTICE_ROUTINE", "RESULT_NOTICE_URGENT", "ACK_REMINDER", "APPOINTMENT", "CALLBACK_CONFIRMATION", "CLOSURE_NOTICE")
+
 class MessageCreate(BaseModel):
     caseId: str
     channel: Literal["SMS", "EMAIL"]
     body: Body2000
+    kind: Literal["RESULT_NOTICE_ROUTINE", "RESULT_NOTICE_URGENT", "ACK_REMINDER", "APPOINTMENT", "CALLBACK_CONFIRMATION", "CLOSURE_NOTICE"] | None = None
+    language: Literal["en", "ar"] = "en"
+    templateVersion: str = Field(default="v1", max_length=20)
 
 class MessageApprove(BaseModel):
     editedBody: Body2000 | None = None
 
 class MessageReject(BaseModel):
     reason: RequiredText
+
+class DocumentReadRequest(BaseModel):
+    caseId: str
+    documentId: str | None = Field(default=None, max_length=120)
+    documentText: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=30000)]
+    patientId: str | None = None
+    facilityId: str | None = None

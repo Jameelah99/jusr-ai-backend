@@ -12,7 +12,8 @@ case_router = APIRouter()      # mounted at /cases
 router = APIRouter()           # mounted at /urgent-cases
 
 def _case(db, user, case_id, *, modify):
-    case = db.get(Case, case_id)
+    from app.api.v1.endpoints.cases import find_case
+    case = find_case(db, case_id)
     if not case or not can_view_case(user, case, db): raise HTTPException(404, "Case not found")
     if modify and (user.role not in CREATE_ROLES or not can_modify_case(user, case)): raise HTTPException(403, "Insufficient permissions")
     return case

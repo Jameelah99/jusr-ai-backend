@@ -14,17 +14,8 @@ def login(form: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get
     if not user or not verify_password(form.password, user.password_hash):
         raise HTTPException(status_code=401, detail="Incorrect email or password")
     token = create_access_token(user.id, user.role.value)
-    return {
-    "success": True,
-    "data": {
-        "accessToken": token,
-        "tokenType": "bearer"
-    },
-    "access_token": token,
-    "token_type": "bearer",
-    "meta": {}
-}
+    return {"success": True, "data": {"accessToken": token, "tokenType": "bearer"}, "meta": {}}
 
 @router.get("/me")
 def me(user=Depends(current_user)):
-    return {"success": True, "data": {"id": user.id, "email": user.email, "displayName": user.display_name, "role": user.role.value, "facilityId": user.facility_id}, "meta": {}}
+    return {"success": True, "data": {"id": user.id, "email": user.email, "displayName": user.display_name, "role": user.role.value, "facilityId": user.facility_id, "specialty": user.specialty, "authorisedToClose": user.authorised_to_close}, "meta": {}}

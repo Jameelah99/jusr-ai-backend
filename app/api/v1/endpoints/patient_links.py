@@ -1,10 +1,12 @@
 """Staff side of patient access: generate/resend links, record assisted responses, read responses."""
 import secrets
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
+from app.core import clock
 from uuid import uuid4
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from app.core.config import settings
+from app.services import settings_store
 from app.core.database import get_db
 from app.core.permissions import CREATE_ROLES, can_modify_case, can_view_case
 from app.api.v1.deps import clinical_user
@@ -13,17 +15,20 @@ from app.models.entities import Case, CaseStatus, LinkStatus, Patient, PatientLi
 from app.schemas.patient_access import AssistedResponseCreate
 from app.services.audit import record_event, reject_and_log
 from app.services.tasks import create_task
+from app.services import state_machine as sm
+from app.services.workflow import after_patient_response
 
 router = APIRouter()
 
 def _case_for(db, user, case_id, *, modify):
-    case = db.get(Case, case_id)
+    from app.api.v1.endpoints.cases import find_case
+    case = find_case(db, case_id)
     if not case or not can_view_case(user, case, db): raise HTTPException(404, "Case not found")
     if modify and (user.role not in CREATE_ROLES or not can_modify_case(user, case)): raise HTTPException(403, "Insufficient permissions")
     return case
 
 def _link_status(link: PatientLink) -> str:
-    if link.status == LinkStatus.ACTIVE.value and link.expires_at <= datetime.now(timezone.utc):
+    if link.status == LinkStatus.ACTIVE.value and link.expires_at <= clock.now():
         return "EXPIRED"
     return link.status
 
@@ -34,7 +39,7 @@ def generate_link(case_id: str, db: Session = Depends(get_db), user=Depends(clin
     if case.status == CaseStatus.CLOSED:
         reject_and_log(db, user, case_id=case.id, attempted="link:generate", status_code=409, code="CASE_CLOSED", message="Cannot generate a link for a closed case")
     patient = db.get(Patient, case.patient_id)
-    now = datetime.now(timezone.utc)
+    now = clock.now()
     previous = db.query(PatientLink).filter(PatientLink.case_id == case.id, PatientLink.status.in_([LinkStatus.ACTIVE.value, LinkStatus.LOCKED.value])).all()
     for old in previous:
         old.status = LinkStatus.SUPERSEDED.value; old.superseded_at = now
@@ -67,19 +72,22 @@ def record_assisted_response(case_id: str, payload: AssistedResponseCreate, db: 
     """A response obtained by staff when the patient cannot use the link. Attributed to the staff member; never shown as the patient's own."""
     case = _case_for(db, user, case_id, modify=True)
     sub = str(uuid4())
-    values = [("ACKNOWLEDGEMENT", {"acknowledged": payload.acknowledged}), ("UNDERSTANDING", {"understood": payload.understood}),
+    values = [("ACKNOWLEDGEMENT", {"acknowledged": payload.acknowledged}), ("UNDERSTANDING", {"level": payload.understood_level, "understood": payload.understood_level == "YES"}),
               ("CONFIDENCE", {"rating": payload.confidence}), ("EXPLANATION_STATUS", {"status": payload.explanationStatus}),
               ("CALLBACK_REQUEST", {"requested": payload.callbackRequested})]
     rows = [PatientResponse(case_id=case.id, kind=k, value=v, source="STAFF_ASSISTED", submission_id=sub, note=payload.note,
                             recorded_by_id=user.id, recorded_by_role=user.role.value) for k, v in values]
     db.add_all(rows)
     if payload.explanationStatus == "NOT_EXPLAINED":
+        case.flag_not_explained = True
         create_task(db, case, "NOT_EXPLAINED", "Patient says the information was not understood or explained", "Recorded by staff on the patient's behalf.", source_ref=sub)
     if payload.callbackRequested:
         create_task(db, case, "CALLBACK_REQUESTED", "Patient requested a call-back", payload.note, source_ref=sub)
     record_event(db, user, case_id=case.id, event_type="ASSISTED_RESPONSE_RECORDED", description="Staff-assisted patient response recorded",
-                 new_values={"submissionId": sub, "source": "STAFF_ASSISTED", "acknowledged": payload.acknowledged, "understood": payload.understood,
+                 new_values={"submissionId": sub, "source": "STAFF_ASSISTED", "acknowledged": payload.acknowledged, "understood": payload.understood_level == "YES", "understanding": payload.understood_level,
                              "confidence": payload.confidence, "explanationStatus": payload.explanationStatus, "callbackRequested": payload.callbackRequested})
+    db.flush()
+    after_patient_response(db, case, actor=sm.SYSTEM, source="STAFF_ASSISTED", staff_id=user.id)
     db.commit()
     return {"success": True, "data": {"submissionId": sub, "source": "STAFF_ASSISTED", "submittedByPatient": False,
                                       "recordedBy": {"id": user.id, "displayName": user.display_name, "role": user.role.value},
