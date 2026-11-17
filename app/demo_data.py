@@ -134,10 +134,17 @@ class Seeder:
         self.d.wait(hours=2)
 
     def referral_of(self, case):
-        for r in self.d.call("recv", "GET", "/referrals", params={"caseId": case, "status": "SENT", "pageSize": 100}):
-            return r["id"]
+        referrals = self.d.call(
+            "recv2",
+            "GET",
+            "/referrals",
+            params={"caseId": case, "status": "SENT", "pageSize": 100}
+        )
+        for referral in referrals:
+            return referral["id"]
+        raise RuntimeError(f"No SENT referral found for case {case}")
 
-    def accept(self, case, who="recv"):
+    def accept(self, case, who="recv2"):
         rid = self.referral_of(case)
         self.d.call(who, "POST", f"/referrals/{rid}/accept", json={}); self.d.wait(hours=4)
 
@@ -147,7 +154,7 @@ class Seeder:
         self.d.call("coordR", "POST", f"/cases/{case}/appointments/{a['id']}/attendance", json=body); self.d.wait(hours=6)
 
     def treat(self, case, kind="TREATMENT"):
-        self.d.call("recv", "POST", f"/cases/{case}/treatment-start", json={"kind": kind, "startDate": clock.now().isoformat(), "note": "Start recorded by the treating clinician"}); self.d.wait(hours=8)
+        self.d.call("recv2", "POST", f"/cases/{case}/treatment-start", json={"kind": kind, "startDate": clock.now().isoformat(), "note": "Start recorded by the treating clinician"}); self.d.wait(hours=8)
 
     def close(self, case, ctype="CARE_CONFIRMED", reason="Care confirmed", who="coord"):
         body = {"closureType": ctype, "reason": reason}
@@ -157,8 +164,14 @@ class Seeder:
 
     # -- scenarios
     def s_full(self, i):
-        c = self.start("S1 routine referral to treatment, closed"); self.classify(c); self.to_ack(c, confidence=3 + i % 3)
-        self.refer(c); self.accept(c); self.book_attend(c); self.treat(c); self.close(c)
+        c = self.start("S1 routine referral to treatment, closed")
+        self.classify(c)
+        self.to_ack(c, confidence=3 + i % 3)
+        self.refer(c)
+        self.accept(c)
+        self.book_attend(c)
+        self.treat(c)
+        self.close(c)
 
     def s_confirm_no_care(self, i):
         c = self.start("S2 confirmatory test shows no care needed", confirmatory=True); self.classify(c); self.to_ack(c)
@@ -197,7 +210,7 @@ class Seeder:
     def s_declined(self, i):
         c = self.start("S8 referral declined"); self.classify(c); self.to_ack(c); self.refer(c)
         rid = self.referral_of(c)
-        self.d.call("recv", "POST", f"/referrals/{rid}/decline", json={"code": "NO_CAPACITY", "reason": "No capacity this month"}); self.d.wait(hours=6)
+        self.d.call("recv2", "POST", f"/referrals/{rid}/decline", json={"code": "NO_CAPACITY", "reason": "No capacity this month"}); self.d.wait(hours=6)
         if i % 3 != 0:
             self.refer(c); self.accept(c, "recv2")
             if i % 3 == 1: self.book_attend(c)
@@ -223,9 +236,9 @@ class Seeder:
         k = self.d.call("refer", "POST", "/consultations", json={"caseId": c, "type": "CLINICIAN_TO_CLINICIAN", "recipientSpecialty": "COLPOSCOPY", "question": "Is a colposcopy needed before a referral?"})
         self.d.wait(hours=3)
         if i % 3 != 2:
-            self.d.call("recv", "POST", f"/consultations/{k['id']}/accept", json={}); self.d.wait(hours=2)
+            self.d.call("recv2", "POST", f"/consultations/{k['id']}/accept", json={}); self.d.wait(hours=2)
             if i % 3 == 0:
-                self.d.call("recv", "POST", f"/consultations/{k['id']}/outcome", json={"outcomeType": "ADVICE_GIVEN", "note": "Refer directly for colposcopy"}); self.d.wait(hours=1)
+                self.d.call("recv2", "POST", f"/consultations/{k['id']}/outcome", json={"outcomeType": "ADVICE_GIVEN", "note": "Refer directly for colposcopy"}); self.d.wait(hours=1)
         self.refer(c)
 
     def extras(self):

@@ -13,6 +13,10 @@ def spec(client, org):
     db = client.session_factory()
     for key, value in {"recv": "COLPOSCOPY", "recvB": "COLPOSCOPY", "recvB2": "SURGERY"}.items():
         db.get(User, org["ids"][key]).specialty = value
+    # This module tests the urgent-routing API after T4. The shared `org`
+    # fixture's CA is intentionally AWAITING_ACK for patient-link tests.
+    case = db.get(Case, org["ids"]["ca"])
+    case.status = CaseStatus.URGENT_ROUTING
     db.commit(); db.close()
 
 def route(client, org, who="coord", case="ca", **body):
@@ -50,9 +54,9 @@ def test_route_picks_a_qualified_clinician_and_lists_it_for_them_only(client, or
     st = r.json()["data"]["routing"]
     assert st["status"] == "AWAITING_ACCEPTANCE" and st["stage"] == 0 and st["requiredSpecialty"] == "COLPOSCOPY"
     assert st["routedClinician"]["id"] == org["ids"]["recv"]                  # same-facility clinician preferred
-    assert st["firstLimitMinutes"] == 30 and st["secondLimitMinutes"] == 30   # defaults from settings
+    assert st["firstLimitMinutes"] == 120 and st["secondLimitMinutes"] == 120   # defaults from settings_store
     due = datetime.fromisoformat(st["dueAt"].replace("Z", "+00:00")) - datetime.now(timezone.utc)
-    assert timedelta(minutes=29) < due <= timedelta(minutes=30, seconds=5)
+    assert timedelta(minutes=119) < due <= timedelta(minutes=120, seconds=5)
     ev = events(client, org)[-1]
     assert ev["eventType"] == "URGENT_CASE_ROUTED" and ev["actorRole"] == "COORDINATOR" and ev["actorId"] == org["ids"]["coord"]
     item = mine(client, org, "recv").json()["data"][0]
@@ -63,7 +67,17 @@ def test_route_picks_a_qualified_clinician_and_lists_it_for_them_only(client, or
 
 def test_route_validation_and_permissions(client, org, spec):
     ids = org["ids"]
+    # This test verifies the missing-specialty validation specifically.
+    # The shared fixture seeds CA with COLPOSCOPY for the other routing tests.
+    db = client.session_factory()
+    case = db.get(Case, ids["ca"])
+    original_specialty = case.required_specialty
+    case.required_specialty = None
+    db.commit(); db.close()
     err(route(client, org), 422, "SPECIALTY_REQUIRED")
+    db = client.session_factory()
+    db.get(Case, ids["ca"]).required_specialty = original_specialty
+    db.commit(); db.close()
     err(route(client, org, specialty="COLPOSCOPY", receivingClinicianId=ids["recvB2"]), 422, "SPECIALTY_MISMATCH")
     err(route(client, org, specialty="COLPOSCOPY", receivingClinicianId=ids["coord"]), 422, "INVALID_ASSIGNEE")
     err(route(client, org, specialty="COLPOSCOPY", receivingClinicianId="nope"), 404)
@@ -229,5 +243,13 @@ def test_case_create_can_carry_the_required_specialty(client, org):
 
 def test_referral_response_has_referring_clinician_details(client, org):
     db = client.session_factory(); db.get(Case, org["ids"]["ca"]).delay_reason_code = "AWAITING_RESULTS"; db.commit(); db.close()
+    # T9 requires the result to be acknowledged and understood before referral.
+    ack = client.post(
+        f"/api/cases/{org['ids']['ca']}/assisted-responses",
+        headers=org["auth"]("coord"),
+        json={"acknowledged": True, "understood": "YES", "confidence": 4,
+              "explanationStatus": "EXPLAINED", "callbackRequested": False},
+    )
+    assert ack.status_code == 200, ack.text
     d = client.post("/api/referrals", headers=org["auth"]("refer"), json={"caseId": org["ids"]["ca"], "receivingFacilityId": org["ids"]["fb"]}).json()["data"]
-    assert d["referredBy"] == {"id": org["ids"]["refer"], "displayName": "refer@x", "role": "REFERRING_CLINICIAN"}
+    assert d["referredBy"] == {"id": org["ids"]["refer"], "displayName": "Demo Referring Clinician", "role": "REFERRING_CLINICIAN"}

@@ -28,7 +28,7 @@ def events(client, org, case="ca"):
     return client.get(f"/api/cases/{org['ids'][case]}/events", headers=org["auth"]("national")).json()["data"]
 
 def delay(client, org):
-    client.post(f"/api/cases/{org['ids']['ca']}/delay-reason", headers=org["auth"]("coord"), json={"code": "AWAITING_RESULTS"})
+    client.post(f"/api/cases/{org['ids']['ca']}/delay-reason", headers=org["auth"]("coord"), json={"code": "RESULT_OR_DATA_MISSING"})
 
 # ---------- the AI service is strictly read-only ----------
 
@@ -68,14 +68,15 @@ def test_urgency_suggestion_needs_approval(client, org):
     assert case_of(client, org)["priority"] == "URGENT"                       # unchanged
     err(decide(client, org, s["id"], "approve", "fadmin"), 403)
     err(decide(client, org, s["id"], "approve", "recv"), 403)
-    err(decide(client, org, s["id"], "approve", "coordB"), 404)               # other facility cannot even see it
-    d = decide(client, org, s["id"]).json()["data"]
-    assert d["status"] == "APPROVED" and d["decidedById"] == org["ids"]["coord"] and d["applied"]["priority"] == "NORMAL"
+    err(decide(client, org, s["id"], "approve", "coordB"), 404)
+    err(decide(client, org, s["id"], "approve", "coord"), 403)
+    d = decide(client, org, s["id"], "approve", "refer").json()["data"]
+    assert d["status"] == "APPROVED" and d["decidedById"] == org["ids"]["refer"] and d["applied"]["priority"] == "NORMAL"
     assert case_of(client, org)["priority"] == "NORMAL"
     ev = [e for e in events(client, org) if e["eventType"] in ("AI_SUGGESTION_SUBMITTED", "CASE_PRIORITY_CHANGED", "AI_SUGGESTION_APPROVED")]
-    assert [(e["eventType"], e["actorRole"]) for e in ev] == [("AI_SUGGESTION_SUBMITTED", "AI_SERVICE"), ("CASE_PRIORITY_CHANGED", "COORDINATOR"), ("AI_SUGGESTION_APPROVED", "COORDINATOR")]
-    err(decide(client, org, s["id"]), 409, "SUGGESTION_ALREADY_DECIDED")
-    err(decide(client, org, s["id"], "reject", body={"reason": "late"}), 409, "SUGGESTION_ALREADY_DECIDED")
+    assert [(e["eventType"], e["actorRole"]) for e in ev] == [("AI_SUGGESTION_SUBMITTED", "AI_SERVICE"), ("CASE_PRIORITY_CHANGED", "REFERRING_CLINICIAN"), ("AI_SUGGESTION_APPROVED", "REFERRING_CLINICIAN")]
+    err(decide(client, org, s["id"], "approve", "refer"), 409, "SUGGESTION_ALREADY_DECIDED")
+    err(decide(client, org, s["id"], "reject", "refer", body={"reason": "late"}), 409, "SUGGESTION_ALREADY_DECIDED")
 
 def test_rejecting_needs_a_reason_and_changes_nothing(client, org):
     s = sub_ok(client, org, "URGENCY", {"priority": "NORMAL", "actionability": "ACTIONABLE", "rationale": "r"})
@@ -91,7 +92,7 @@ def test_suggestion_list_filters_and_scope(client, org):
     lst = lambda who, q="": client.get(f"/api/ai/suggestions{q}", headers=org["auth"](who)).json()
     assert lst("coord")["meta"]["total"] == 2 and lst("coordB")["meta"]["total"] == 0
     assert lst("coord", "?kind=URGENCY")["meta"]["total"] == 1 and lst("coord", "?caseId=CA")["meta"]["total"] == 2
-    decide(client, org, a["id"])
+    decide(client, org, a["id"], "approve", "refer")
     assert lst("coord", "?status=PENDING")["meta"]["total"] == 1 and lst("ai")["meta"]["total"] == 2
     err(client.get("/api/ai/suggestions", headers=org["auth"]("fadmin")), 403)
     err(client.get("/api/ai/suggestions?kind=NOPE", headers=org["auth"]("coord")), 422, "VALIDATION_ERROR")
@@ -99,7 +100,7 @@ def test_suggestion_list_filters_and_scope(client, org):
 
 def test_edit_only_allowed_on_message_drafts(client, org):
     s = sub_ok(client, org, "URGENCY", {"priority": "NORMAL", "actionability": "ACTIONABLE", "rationale": "r"})
-    err(decide(client, org, s["id"], body={"editedBody": "x"}), 422, "EDIT_NOT_ALLOWED")
+    err(decide(client, org, s["id"], "approve", "refer", body={"editedBody": "x"}), 422, "EDIT_NOT_ALLOWED")
 
 # ---------- case summaries with source citations ----------
 
@@ -127,15 +128,23 @@ def test_referral_target_creates_the_referral_only_on_approval(client, org):
     ids = org["ids"]
     s = sub_ok(client, org, "REFERRAL_TARGET", {"receivingFacilityId": ids["fb"], "rationale": "Nearest colposcopy", "alternatives": [{"receivingFacilityId": ids["fc"], "rationale": "Farther"}]})
     assert client.get("/api/referrals", headers=org["auth"]("national")).json()["meta"]["total"] == 1       # only the seeded one
-    err(decide(client, org, s["id"]), 422, "DELAY_REASON_REQUIRED")                                          # same rules as a direct referral
+    err(decide(client, org, s["id"], "approve", "refer"), 422, "ACKNOWLEDGEMENT_REQUIRED")
     assert client.get(f"/api/ai/suggestions/{s['id']}", headers=org["auth"]("coord")).json()["data"]["status"] == "PENDING"
-    delay(client, org)
-    d = decide(client, org, s["id"]).json()["data"]
+
+    ack = client.post(
+        f"/api/cases/{ids['ca']}/assisted-responses",
+        headers=org["auth"]("coord"),
+        json={"acknowledged": True, "understood": "YES", "confidence": 4,
+              "explanationStatus": "EXPLAINED", "callbackRequested": False},
+    )
+    assert ack.status_code == 200, ack.text
+
+    d = decide(client, org, s["id"], "approve", "refer").json()["data"]
     assert d["status"] == "APPROVED"
-    ref = client.get(f"/api/referrals/{d['applied']['referralId']}", headers=org["auth"]("coord")).json()["data"]
-    assert ref["status"] == "PENDING" and ref["receivingFacility"]["name"] == "B" and ref["reason"] == "Nearest colposcopy" and ref["case"]["status"] == "REFERRED"
+    ref = client.get(f"/api/referrals/{d['applied']['referralId']}", headers=org["auth"]("refer")).json()["data"]
+    assert ref["status"] == "SENT" and ref["receivingFacility"]["name"] == "B" and ref["reason"] == "Nearest colposcopy" and ref["case"]["status"] == "REFERRAL_PENDING"
     created = next(e for e in events(client, org) if e["eventType"] == "REFERRAL_CREATED")
-    assert created["actorRole"] == "COORDINATOR"
+    assert created["actorRole"] == "REFERRING_CLINICIAN"
     err(submit(client, org, "REFERRAL_TARGET", {"receivingFacilityId": "nope", "rationale": "x"}), 404)
 
 # ---------- intake ----------
@@ -152,10 +161,12 @@ def test_intake_creates_a_case_only_after_staff_approve(client, org):
     err(decide(client, org, s["id"], who="fadmin"), 403)
     d = decide(client, org, s["id"]).json()["data"]
     assert "NEW-1" in nums() and d["caseId"] == d["applied"]["caseId"]
-    case = client.get("/api/cases?status=OPEN", headers=org["auth"]("coord")).json()["data"][0]
+    case = next(c for c in client.get("/api/cases", headers=org["auth"]("coord")).json()["data"] if c["caseId"] == "NEW-1")
     assert case["caseId"] == "NEW-1" and case["priority"] == "HIGH"
     ev = client.get(f"/api/cases/{d['caseId']}/events", headers=org["auth"]("coord")).json()["data"]
-    assert ev[0]["eventType"] == "CASE_CREATED" and ev[0]["actorRole"] == "COORDINATOR"
+    assert [e["eventType"] for e in ev].count("CASE_TRANSITION") >= 2
+    assert ev[0]["eventType"] == "CASE_TRANSITION"
+    assert ev[0]["actorRole"] == "COORDINATOR"
     dup = sub_ok(client, org, "INTAKE", payload, case=None)
     err(decide(client, org, dup["id"]), 409, "DUPLICATE_CASE_ID")
     assert client.get(f"/api/ai/suggestions/{dup['id']}", headers=org["auth"]("coord")).json()["data"]["status"] == "PENDING"
@@ -233,13 +244,14 @@ def test_failed_message_is_retried_then_marked_failed_and_staff_alerted(client, 
     assert m["status"] == "RETRYING" and m["attempts"] == 1 and m["nextRetryAt"] and m["lastError"] == "gateway timeout"
     assert process(client, org).json()["data"]["processed"] == 0                                    # not due yet
     make_due(client, mid); assert process(client, org).json()["data"] == {"processed": 1, "sent": 0, "retrying": 1, "failed": 0}
+    make_due(client, mid); assert process(client, org).json()["data"] == {"processed": 1, "sent": 0, "retrying": 1, "failed": 0}
     make_due(client, mid); assert process(client, org).json()["data"] == {"processed": 1, "sent": 0, "retrying": 0, "failed": 1}
     m = client.get(f"/api/messages/{mid}", headers=org["auth"]("coord")).json()["data"]
-    assert m["status"] == "MESSAGE_FAILED" and m["attempts"] == 3 and m["nextRetryAt"] is None and provider.calls == 3
+    assert m["status"] == "MESSAGE_FAILED" and m["attempts"] == 4 and m["nextRetryAt"] is None and provider.calls == 4
     alerts = client.get("/api/tasks?type=MESSAGE_FAILED&status=OPEN", headers=org["auth"]("coord")).json()["data"]
     assert len(alerts) == 1 and alerts[0]["caseId"] == org["ids"]["ca"]
     types = [e["eventType"] for e in events(client, org)]
-    assert types.count("MESSAGE_SEND_FAILED") == 2 and types.count("MESSAGE_FAILED") == 1
+    assert types.count("MESSAGE_SEND_FAILED") == 3 and types.count("MESSAGE_FAILED") == 1
     assert process(client, org).json()["data"]["processed"] == 0                                    # no further automatic retries
     err(send(client, org, mid), 409, "MESSAGE_NOT_APPROVED")
 

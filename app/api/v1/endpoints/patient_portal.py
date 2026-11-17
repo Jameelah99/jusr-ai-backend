@@ -85,23 +85,25 @@ def view_link(token: str, session: str | None = SessionHeader, db: Session = Dep
     facility = db.get(Facility, case.facility_id)
     db.commit()
     # Only what the patient needs: no age, sex, ids of other records, coordinator or workflow detail.
-    return {"success": True, "data": {
-        "patient": {"displayLabel": patient.display_label},
-        "facility": {"name": facility.name},
-        "screening": {"displayLabel": screening.display_label} if screening else None,
-        "nextAction": {"label": case.next_action_label} if case.next_action_label else None,
-        "dueAt": case.due_at, "expiresAt": link.expires_at,
-        "language": patient.preferred_language,
-        "urgencyText": "needs attention soon" if case.priority == Priority.URGENT else "needs follow-up",
-        "progress": _progress(case),
-        "contact": _contact(db, case, facility),
-        "canGiveReassurance": case.status in (CaseStatus.AWAITING_TREATMENT, CaseStatus.READY_TO_CLOSE, CaseStatus.CLOSED),
-        "responses": {"acknowledged": "ACKNOWLEDGEMENT" in latest, "understood": (latest.get("UNDERSTANDING") or {}).get("understood"),
-                      "understanding": sm.understanding_level(PatientResponse(value=latest.get("UNDERSTANDING"))) if latest.get("UNDERSTANDING") else None,
-                      "confidence": (latest.get("CONFIDENCE") or {}).get("rating"),
-                      "explanationStatus": (latest.get("EXPLANATION_STATUS") or {}).get("status"),
-                      "callbackRequested": "CALLBACK_REQUEST" in latest},
-    }, "meta": {}}
+    return {
+        "success": True,
+        "data": {
+            "patient": {"displayLabel": patient.display_label},
+            "facility": {"name": facility.name},
+            "screening": {"displayLabel": screening.display_label} if screening else None,
+            "nextAction": {"label": case.next_action_label} if case.next_action_label else None,
+            "dueAt": case.due_at,
+            "expiresAt": link.expires_at,
+            "responses": {
+                "acknowledged": "ACKNOWLEDGEMENT" in latest,
+                "understood": (latest.get("UNDERSTANDING") or {}).get("understood"),
+                "confidence": (latest.get("CONFIDENCE") or {}).get("rating"),
+                "explanationStatus": (latest.get("EXPLANATION_STATUS") or {}).get("status"),
+                "callbackRequested": "CALLBACK_REQUEST" in latest,
+            },
+        },
+        "meta": {},
+    }
 
 @router.post("/{token}/verify")
 def verify(token: str, payload: VerifyBody, db: Session = Depends(get_db)):

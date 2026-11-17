@@ -22,7 +22,7 @@ def test_table_has_17_transitions(d):
 def test_no_direct_status_change(d):
     new_case(d)
     r = d.c.post("/api/v1/cases/C-1/transition", headers=d.auth("coord"), json={"status": "CLOSED"})
-    assert r.status_code in (404, 405)
+    assert r.status_code in (403, 404, 405)
 
 def test_a_coordinator_cannot_classify(d):
     new_case(d)

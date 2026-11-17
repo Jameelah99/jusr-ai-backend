@@ -30,12 +30,36 @@ def list_tasks(page: int = Query(1, ge=1), pageSize: int = Query(20, ge=1, le=10
 
 @router.post("/{task_id}/complete")
 def complete_task(task_id: str, db: Session = Depends(get_db), user=Depends(clinical_user)):
+    if user.role not in CREATE_ROLES:
+        raise HTTPException(403, "Insufficient permissions")
+
     t = _visible(db.query(Task), user).filter(Task.id == task_id).first()
-    if not t: raise HTTPException(404, "Task not found")
-    if user.role not in CREATE_ROLES: raise HTTPException(403, "Insufficient permissions")
+    if not t:
+        raise HTTPException(404, "Task not found")
+
     if t.status != "OPEN":
-        reject_and_log(db, user, case_id=t.case_id, attempted="task:complete", status_code=409, code="TASK_ALREADY_DONE", message="Task is already completed")
-    t.status = "DONE"; t.completed_at = datetime.now(timezone.utc); t.completed_by_id = user.id
-    record_event(db, user, case_id=t.case_id, event_type="TASK_COMPLETED", description=f"Task completed: {t.type}", new_values={"taskId": t.id})
+        reject_and_log(
+            db,
+            user,
+            case_id=t.case_id,
+            attempted="task:complete",
+            status_code=409,
+            code="TASK_ALREADY_DONE",
+            message="Task is already completed",
+        )
+
+    t.status = "DONE"
+    t.completed_at = datetime.now(timezone.utc)
+    t.completed_by_id = user.id
+
+    record_event(
+        db,
+        user,
+        case_id=t.case_id,
+        event_type="TASK_COMPLETED",
+        description=f"Task completed: {t.type}",
+        new_values={"taskId": t.id},
+    )
+
     db.commit()
     return {"success": True, "data": _out(t), "meta": {}}

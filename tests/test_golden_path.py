@@ -3,7 +3,7 @@ from app.core import clock
 def case_status(d, case, who="coord"):
     return d.call(who, "GET", f"/cases/{case}")
 
-def test_referral_route_end_to_end(d, org):
+def test_referral_route_end_to_end(d):
     r = d.feed("E1", "hc", patient={"name": "Patient 001", "birthYear": None, "recordNumber": "MRN00001"}, case_number="C-1", confirmatory=False)
     assert r["status"] == "ACCEPTED", r
     # name + record number = two identifiers: high confidence, so T1 and T2 ran
@@ -14,7 +14,7 @@ def test_referral_route_end_to_end(d, org):
     assert case_status(d, "C-1")["status"] == "AWAITING_ACK"
     tok = d.patient_link("C-1")
     d.patient_replies(tok, understood="YES", confidence=5, case="C-1")
-    d.call("refer", "POST", "/referrals", json={"caseId": "C-1", "receivingFacilityId": org["rrh"], "targetSpecialty": "COLPOSCOPY", "reason": "Abnormal HPV"})
+    d.call("refer", "POST", "/referrals", json={"caseId": "C-1", "receivingFacilityId": d.ids["rrh"], "targetSpecialty": "COLPOSCOPY", "reason": "Abnormal HPV"})
     c = case_status(d, "C-1"); assert c["status"] == "REFERRAL_PENDING"
     ref = d.call("recv", "GET", "/referrals")[0]
     d.call("recv", "POST", f"/referrals/{ref['id']}/accept", json={})

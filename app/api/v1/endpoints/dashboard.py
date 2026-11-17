@@ -2,8 +2,6 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 from app.core import clock
-from app.core.config import settings
-from app.models.entities import InboundEvent
 from app.services import state_machine as sm
 from app.core.database import get_db
 from app.core.permissions import visible_cases
@@ -84,7 +82,10 @@ def _receiving_view(db, user, now):
 def _facility_admin_view(db, user, now):
     """Staff access and facility connection only. No patient or clinical case data (R-09)."""
     facility = db.get(Facility, user.facility_id) if user.facility_id else None
-    staff = db.query(User).filter(User.facility_id == user.facility_id, User.role != Role.PATIENT).all() if user.facility_id else []
+    staff = db.query(User).filter(
+        User.facility_id == user.facility_id,
+        User.role.in_((Role.COORDINATOR, Role.REFERRING_CLINICIAN, Role.RECEIVING_CLINICIAN, Role.FACILITY_ADMIN)),
+    ).all() if user.facility_id else []
     by_role = {}
     for u in staff:
         by_role[u.role.value] = by_role.get(u.role.value, 0) + 1
@@ -92,8 +93,7 @@ def _facility_admin_view(db, user, now):
         "facility": {"id": facility.id, "name": facility.name, "code": facility.code} if facility else None,
         "staffAccess": {"totalStaff": len(staff), "activeStaff": sum(u.is_active for u in staff), "inactiveStaff": sum(not u.is_active for u in staff), "byRole": by_role},
         "connection": {"status": facility.connection_status if facility else "UNKNOWN", "connectorType": facility.connector_type if facility else None,
-                       "lastEventAt": facility.last_event_at if facility else None, "demoMode": settings.demo_mode},
-        "rejectedItems": db.query(InboundEvent).filter(InboundEvent.status == "REJECTED", InboundEvent.facility_id == user.facility_id).count() if user.facility_id else 0,  # a count only (R-09)
+                       "lastEventAt": facility.last_event_at if facility else None},
     }
 
 VIEWS = {
@@ -112,5 +112,7 @@ def dashboard_summary(db: Session = Depends(get_db), user=Depends(current_user))
         raise HTTPException(403, "Insufficient permissions")
     now = clock.now()
     data = view(db, user, now)
-    data.update({"role": user.role.value, "generatedAt": now, "demoClock": {"active": clock.is_active(), "offsetMinutes": clock.offset_minutes()}})
+    data.update({"role": user.role.value, "generatedAt": now})
+    if user.role != Role.FACILITY_ADMIN:
+        data["demoClock"] = {"active": clock.is_active(), "offsetMinutes": clock.offset_minutes()}
     return {"success": True, "data": data, "meta": {}}

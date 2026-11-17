@@ -51,6 +51,12 @@ def transition_table(user=Depends(clinical_user)):
     """The state machine as data: transitions T1 to T17 with who may do each and what it is refused unless."""
     return {"success": True, "data": {"statuses": [s.value for s in CaseStatus], "transitions": sm.transition_table()}, "meta": {}}
 
+
+@router.post("/{case_id}/transition", include_in_schema=False)
+def reject_direct_transition(case_id: str, payload: dict, user=Depends(clinical_user)):
+    """Reject direct status mutation. State changes must use the dedicated workflow actions."""
+    raise HTTPException(403, "Direct status changes are not allowed; use the corresponding workflow action")
+
 # ---------- list, create, read ----------
 
 @router.get("")
@@ -125,7 +131,7 @@ def assign_case(case_id: str, payload: CaseAssign, db: Session = Depends(get_db)
     owner = db.get(User, payload.ownerId or payload.coordinatorId)
     if not owner: raise HTTPException(404, "User not found")
     if owner.role not in (Role.COORDINATOR, Role.REFERRING_CLINICIAN, Role.RECEIVING_CLINICIAN) or not owner.is_active:
-        raise HTTPException(422, detail={"code": "INVALID_ASSIGNEE", "message": "A case can only be assigned to an active coordinator or clinician"})
+        raise HTTPException(422, detail={"code": "INVALID_ASSIGNEE", "message": "A case can only be assigned to an active clinical staff member"})
     if user.role != Role.NATIONAL_ADMIN and owner.facility_id != case.facility_id:
         raise HTTPException(422, detail={"code": "INVALID_ASSIGNEE", "message": "The owner must work at the case's facility"})
     if case.status == CaseStatus.CLOSED:

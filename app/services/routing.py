@@ -132,11 +132,10 @@ def accept_case(db, user, case: Case) -> Case:
     from app.services import state_machine as sm
     stage = case.routing_stage
     sm.apply(db, user, case, "T5", ctx={"clinician": user}, at=now, flags={"exception": False},
-             details={"routedClinicianId": user.id, "stage": stage, "requiredSpecialty": case.required_specialty})
+             details={"routedClinicianId": user.id, "stage": stage, "requiredSpecialty": case.required_specialty,
+                      "acceptedAt": now.isoformat()}, event_type="URGENT_CASE_ACCEPTED")
     case.routing_status = RoutingStatus.ACCEPTED.value; case.routing_accepted_at = now; case.routing_due_at = None
     _close_routing_tasks(db, case, now)
-    record_event(db, user, case_id=case.id, event_type="URGENT_CASE_ACCEPTED", description="Urgent case accepted by the receiving clinician", at=now,
-                 new_values={"routedClinicianId": user.id, "stage": stage, "acceptedAt": now.isoformat()})
     return case
 
 def process_due_routing(db, actor, case_query=None, now=None) -> dict:

@@ -3,7 +3,7 @@ from app import demo_data
 from app.core import clock
 
 def test_seeded_log_has_about_sixty_cases_across_the_states_and_flags(client, org):
-    d = demo_data.Driver(client, org)
+    d = demo_data.Driver(client, org["ids"])
     s = demo_data.Seeder(d)
     s.window_days = 30
     s.run(); clock.reset()

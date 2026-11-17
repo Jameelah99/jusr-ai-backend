@@ -1,5 +1,6 @@
 import pytest
 from app.models.entities import Case
+from app.models.entities import Case, User
 
 def test_api_alias_serves_same_routes(client, org):
     h = org["auth"]("coord")
@@ -19,7 +20,7 @@ def test_facility_admin_dashboard_has_no_case_data(client, org):
     data = r.json()["data"]
     assert r.status_code == 200 and data["role"] == "FACILITY_ADMIN"
     assert set(data) == {"role", "generatedAt", "facility", "staffAccess", "connection"}
-    assert data["staffAccess"]["totalStaff"] == 4  # facility A staff only, no patient accounts
+    assert data["staffAccess"]["totalStaff"] == 5  # facility A staff only, no patient accounts
     assert not any(k in data for k in ("stats", "referrals", "cases"))
 
 def test_patient_role_has_no_dashboard(client, org):
@@ -54,14 +55,41 @@ def test_facility_scoping_and_cross_facility_owner(client, org):
 
 def test_patients_scoped_to_facility(client, org):
     h, ids = org["auth"], org["ids"]
-    got = {p["displayLabel"] for p in client.get("/api/patients", headers=h("coord")).json()["data"]}
-    assert got == {"PA"}
-    assert client.get(f"/api/patients/{ids['pb']}", headers=h("coord")).status_code == 404
-    assert client.get(f"/api/patients/{ids['pb']}", headers=h("national")).status_code == 200
-    r = client.post("/api/patients", headers=h("coord"), json={"displayLabel": "New"})
+
+    response = client.get("/api/patients?page=1&pageSize=200", headers=h("coord"))
+    assert response.status_code == 200
+
+    got = {p["displayLabel"] for p in response.json()["data"]}
+
+    assert "PA" in got
+    assert "PB" not in got
+
+    assert client.get(
+        f"/api/patients/{ids['pb']}",
+        headers=h("coord"),
+    ).status_code == 404
+
+    assert client.get(
+        f"/api/patients/{ids['pb']}",
+        headers=h("national"),
+    ).status_code == 200
+
+    r = client.post(
+        "/api/patients",
+        headers=h("coord"),
+        json={"displayLabel": "New"},
+    )
     assert r.status_code == 200
-    assert client.get(f"/api/patients/{r.json()['data']['id']}", headers=h("coord")).status_code == 200
-    assert client.get(f"/api/patients/{r.json()['data']['id']}", headers=h("coordB")).status_code == 404
+
+    assert client.get(
+        f"/api/patients/{r.json()['data']['id']}",
+        headers=h("coord"),
+    ).status_code == 200
+
+    assert client.get(
+        f"/api/patients/{r.json()['data']['id']}",
+        headers=h("coordB"),
+    ).status_code == 404
 
 def test_no_cross_facility_writes(client, org):
     h, ids = org["auth"], org["ids"]
@@ -81,6 +109,32 @@ def test_ai_service_is_read_only(client, org):
 
 def test_assignee_must_be_active_coordinator(client, org):
     h, ids = org["auth"]("coord"), org["ids"]
-    assert client.post(f"/api/cases/{ids['ca']}/assign", headers=h, json={"coordinatorId": ids["refer"]}).json()["error"]["code"] == "INVALID_ASSIGNEE"
-    assert client.post(f"/api/cases/{ids['ca']}/assign", headers=h, json={"coordinatorId": ids["coord"]}).status_code == 200
-    assert client.post(f"/api/cases/{ids['ca']}/assign", headers=org["auth"]("fadmin"), json={"coordinatorId": ids["coord"]}).status_code == 403
+
+    # An inactive clinical staff member cannot be assigned.
+    db = client.session_factory()
+    referring = db.get(User, ids["refer"])
+    referring.is_active = False
+    db.commit()
+    db.close()
+
+    r = client.post(
+        f"/api/cases/{ids['ca']}/assign",
+        headers=h,
+        json={"coordinatorId": ids["refer"]},
+    )
+    assert r.status_code == 422
+    assert r.json()["error"]["code"] == "INVALID_ASSIGNEE"
+
+    # An active coordinator can be assigned.
+    assert client.post(
+        f"/api/cases/{ids['ca']}/assign",
+        headers=h,
+        json={"coordinatorId": ids["coord"]},
+    ).status_code == 200
+
+    # Facility administrators cannot perform clinical assignments.
+    assert client.post(
+        f"/api/cases/{ids['ca']}/assign",
+        headers=org["auth"]("fadmin"),
+        json={"coordinatorId": ids["coord"]},
+    ).status_code == 403

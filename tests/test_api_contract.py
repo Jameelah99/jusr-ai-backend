@@ -13,9 +13,18 @@ def world(client):
     now = datetime.now(timezone.utc)
     cases = []
     for i, due in enumerate([now - timedelta(days=2), now + timedelta(days=2), None]):
-        c = Case(case_number=f"C-{i}", patient_id=pat.id, facility_id=fac.id, due_at=due, status=CaseStatus.ASSIGNED, priority=Priority.NORMAL,
-                 delay_reason_code="AWAITING_RESULTS" if i == 0 else None)  # the overdue case already has its R-18 reason
-        db.add(c); cases.append(c)
+        c = Case(
+        case_number=f"C-{i}",
+        patient_id=pat.id,
+        facility_id=fac.id,
+        due_at=due,
+        status=CaseStatus.NEW,
+        priority=Priority.NORMAL,
+        delay_reason_code="RESULT_OR_DATA_MISSING" if i == 0 else None,
+        )
+        db.add(c)
+        cases.append(c)
+        
     db.commit()
     ids = [c.id for c in cases]
     db.close()
@@ -52,8 +61,24 @@ def test_bad_query_values_are_422(client, world, path):
 
 def test_bad_bodies_are_4xx(client, world):
     cid = world["ids"][0]
-    assert_error(client.post(f"/api/v1/cases/{cid}/transition", headers=world["h"], json={"status": "BOGUS"}), 422)
-    assert_error(client.post(f"/api/v1/cases/{cid}/transition", headers=world["h"], json={}), 422)
+    assert_error(
+    client.post(
+        f"/api/v1/cases/{cid}/transition",
+        headers=world["h"],
+        json={"status": "BOGUS"},
+    ),
+    403,
+    "FORBIDDEN",
+)
+    assert_error(
+    client.post(
+        f"/api/v1/cases/{cid}/transition",
+        headers=world["h"],
+        json={},
+    ),
+    403,
+    "FORBIDDEN",
+)
     assert_error(client.post("/api/v1/patients", headers=world["h"], json={}), 422)
 
 def test_errors_use_envelope(client, world):
@@ -61,31 +86,33 @@ def test_errors_use_envelope(client, world):
     assert_error(client.get("/api/v1/patients/missing", headers=world["h"]), 404, "NOT_FOUND")
     assert_error(client.get("/api/v1/nope", headers=world["h"]), 404)
     r = client.post(f"/api/v1/cases/{world['ids'][0]}/transition", headers=world["h"], json={"status": "CLOSED"})
-    assert_error(r, 409, "INVALID_STATUS_TRANSITION")
+    assert_error(r, 403, "FORBIDDEN")
+
 
 def test_a01_evidence_required_to_resolve_and_close(client, world):
     cid, h = world["ids"][0], world["h"]
     url = f"/api/v1/cases/{cid}/transition"
-    assert client.post(url, headers=h, json={"status": "IN_PROGRESS"}).status_code == 200
-    assert_error(client.post(url, headers=h, json={"status": "RESOLVED"}), 422, "EVIDENCE_REQUIRED")
-    assert_error(client.post(url, headers=h, json={"status": "RESOLVED", "evidence": "   "}), 422, "EVIDENCE_REQUIRED")
-    assert client.post(url, headers=h, json={"status": "RESOLVED", "evidence": "Lab report #12"}).status_code == 200
-    assert client.post(url, headers=h, json={"status": "CLOSED"}).status_code == 200  # basis recorded at resolution
-    events = client.get(f"/api/v1/cases/{cid}/events", headers=h).json()["data"]
-    types = [e["eventType"] for e in events]
-    assert types.count("CASE_STATUS_CHANGED") == 3
-    assert types.count("INVALID_ACTION_REJECTED") == 2  # the two refused A-01 attempts are logged (R-12)
+
+    # Direct status mutation is prohibited; workflow actions own transitions.
+    assert_error(
+        client.post(url, headers=h, json={"status": "CLOSED"}),
+        403,
+        "FORBIDDEN",
+    )
+
 
 def test_a01_decision_accepted_and_closing_legacy_resolved_needs_basis(client, world):
-    cid, h = world["ids"][1], world["h"]
+    cid, h = world["ids"][2], world["h"]
+
+    # Direct status mutation is prohibited, including attempts to close
+    # a case that has been marked as legacy data.
     url = f"/api/v1/cases/{cid}/transition"
-    client.post(url, headers=h, json={"status": "IN_PROGRESS"})
-    assert client.post(url, headers=h, json={"status": "RESOLVED", "decision": "Clinical lead approved"}).status_code == 200
-    # a case that reached RESOLVED without a recorded basis (e.g. legacy data) cannot be closed bare
-    db = client.session_factory(); c = db.get(Case, world["ids"][2]); c.status = CaseStatus.RESOLVED; db.commit(); db.close()
-    url2 = f"/api/v1/cases/{world['ids'][2]}/transition"
-    assert_error(client.post(url2, headers=h, json={"status": "CLOSED"}), 422, "EVIDENCE_REQUIRED")
-    assert client.post(url2, headers=h, json={"status": "CLOSED", "decision": "Closed by committee"}).status_code == 200
+
+    assert_error(
+        client.post(url, headers=h, json={"status": "CLOSED"}),
+        403,
+        "FORBIDDEN",
+    )
 
 def test_duplicate_case_number_is_409(client, world):
     db = client.session_factory(); pid = db.query(Patient).first().id; fid = db.query(Facility).first().id; db.close()

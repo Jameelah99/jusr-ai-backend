@@ -155,7 +155,7 @@ def test_assisted_response_requires_every_field(client, org):
         err(assisted(client, org, body={k: v for k, v in BODY.items() if k != missing}), 422, "VALIDATION_ERROR")
     err(assisted(client, org, body={**BODY, "confidence": 0}), 422, "VALIDATION_ERROR")
     err(assisted(client, org, body={**BODY, "explanationStatus": "MAYBE"}), 422, "VALIDATION_ERROR")
-    ok = assisted(client, org, body={**BODY, "explanationStatus": "EXPLAINED", "callbackRequested": False, "note": None})
+    ok = assisted(client, org, body={**BODY, "understood": True, "explanationStatus": "EXPLAINED", "callbackRequested": False, "note": None})
     assert ok.status_code == 200 and tasks(client, org, q="?status=OPEN") == []
 
 @pytest.mark.parametrize("who,status", [("fadmin", 403), ("patient", 403), ("ai", 403), ("recv", 404), ("coordB", 404)])
