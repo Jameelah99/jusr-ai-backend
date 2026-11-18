@@ -6,7 +6,19 @@ from app.services import state_machine as sm
 from app.core.database import get_db
 from app.core.permissions import visible_cases
 from app.api.v1.deps import current_user
-from app.models.entities import Case, Priority, CaseStatus, Referral, Role, RoutingStatus, User, Facility
+from app.models.entities import (
+    Case,
+    Priority,
+    CaseStatus,
+    Referral,
+    Role,
+    RoutingStatus,
+    User,
+    Facility,
+    Patient,
+    Screening,
+    AuditEvent,
+)
 
 router = APIRouter()
 
@@ -21,30 +33,202 @@ def _referral_counts(referrals) -> dict:
 def _open(rows):
     return [c for c in rows if c.status != CaseStatus.CLOSED]
 
+
 def _coordinator_view(db, user, now):
+    # Only cases visible to this Coordinator are included.
     rows = visible_cases(db.query(Case), user).all()
-    sm.sync_overdue(db, [c for c in rows if c.status != CaseStatus.CLOSED], now); db.commit()
+
+    sm.sync_overdue(
+        db,
+        [c for c in rows if c.status != CaseStatus.CLOSED],
+        now,
+    )
+    db.commit()
+
     active = _open(rows)
+
+    # 1. Cases grouped by their actual workflow status.
     by_status = {}
-    for c in active: by_status[c.status.value] = by_status.get(c.status.value, 0) + 1
-    referrals = visible_cases(db.query(Referral).join(Case, Referral.case_id == Case.id), user).all()
+    for case in active:
+        status = case.status.value
+        by_status[status] = by_status.get(status, 0) + 1
+
+    # 2. Referral counts from visible referral records.
+    referrals = visible_cases(
+        db.query(Referral).join(
+            Case, Referral.case_id == Case.id
+        ),
+        user,
+    ).all()
+
+    referral_counts = _referral_counts(referrals)
+
+    # Frontend-compatible referral names.
+    referral_overview = {
+        "total": referral_counts["total"],
+        "pending": referral_counts.get("sent", 0),
+        "accepted": referral_counts.get("accepted", 0),
+        "rejected": referral_counts.get("declined", 0),
+    }
+
+    # 3. Priority queue from actual active cases.
+    priority_rows = [
+        c for c in active
+        if (
+            c.priority in (Priority.URGENT, Priority.HIGH)
+            or c.flag_overdue
+            or c.flag_exception
+            or c.flag_message_failed
+            or c.flag_not_explained
+            or c.flag_data_missing
+        )
+    ]
+
+    priority_rows.sort(
+        key=lambda c: (
+            c.priority != Priority.URGENT,
+            not c.flag_overdue,
+            c.due_at is None,
+            c.due_at or now,
+        )
+    )
+
+    priority_cases = []
+
+    for case in priority_rows[:8]:
+        patient = db.get(Patient, case.patient_id)
+        screening = (
+            db.get(Screening, case.screening_id)
+            if case.screening_id else None
+        )
+        owner = (
+            db.get(User, case.coordinator_id)
+            if case.coordinator_id else None
+        )
+
+        priority_cases.append({
+            "id": case.id,
+            "caseId": case.case_number,
+            "patientLabel": (
+                patient.display_label if patient
+                else "Unknown patient"
+            ),
+            "age": patient.age_years if patient else None,
+            "screeningType": (
+                screening.screening_type if screening else None
+            ),
+            "screeningResult": (
+                screening.outcome if screening else None
+            ),
+            "priority": case.priority.value,
+            "status": case.status.value,
+            "nextStep": (
+                case.next_action_label
+                or case.next_action_code
+                or "No next action recorded"
+            ),
+            "nextActionCode": case.next_action_code,
+            "owner": (
+                owner.display_name if owner else "Unassigned"
+            ),
+            "dueAt": case.due_at,
+            "overdue": case.flag_overdue,
+        })
+
+    # 4. Screening-to-care progress.
+    total_active = len(active)
+
+    care_progress = [
+        {
+            "label": status.replace("_", " ").title(),
+            "count": count,
+            "percentage": (
+                round((count / total_active) * 100)
+                if total_active else 0
+            ),
+        }
+        for status, count in by_status.items()
+    ]
+
+    # 5. Recent activity from the existing append-only audit log.
+    visible_case_ids = [case.id for case in rows]
+
+    activity_query = db.query(AuditEvent).filter(
+        AuditEvent.case_id.in_(visible_case_ids)
+    ) if visible_case_ids else None
+
+    recent_events = (
+        activity_query
+        .order_by(AuditEvent.occurred_at.desc())
+        .limit(10)
+        .all()
+        if activity_query is not None else []
+    )
+
+    recent_activity = []
+
+    for event in recent_events:
+        actor = (
+            db.get(User, event.actor_id)
+            if event.actor_id else None
+        )
+
+        recent_activity.append({
+            "id": event.id,
+            "description": event.description,
+            "actor": (
+                actor.display_name if actor
+                else "System"
+            ),
+            "actorRole": event.actor_role,
+            "eventType": event.event_type,
+            "timestamp": event.occurred_at,
+        })
+
     return {
         "stats": {
             "activeCases": len(active),
-            "urgentCases": sum(c.priority == Priority.URGENT for c in active),
-            "overdueCases": sum(c.flag_overdue for c in active),
-            "unassignedCases": sum(c.coordinator_id is None for c in active),
-            "exceptionCases": sum(c.flag_exception for c in active),
-            "messageFailedCases": sum(c.flag_message_failed for c in active),
-            "notExplainedCases": sum(c.flag_not_explained for c in active),
-            "dataMissingCases": sum(c.flag_data_missing for c in active),
-            "missingDelayReason": sum(c.flag_overdue for c in active),
-            "awaitingUrgentAcceptance": sum(c.routing_status == RoutingStatus.AWAITING_ACCEPTANCE.value for c in active),
-            "urgentRoutingExceptions": sum(c.routing_status == RoutingStatus.EXCEPTION.value for c in active),
+            "urgentCases": sum(
+                c.priority == Priority.URGENT for c in active
+            ),
+            "overdueCases": sum(
+                c.flag_overdue for c in active
+            ),
+            "unassignedCases": sum(
+                c.coordinator_id is None for c in active
+            ),
+            "exceptionCases": sum(
+                c.flag_exception for c in active
+            ),
+            "messageFailedCases": sum(
+                c.flag_message_failed for c in active
+            ),
+            "notExplainedCases": sum(
+                c.flag_not_explained for c in active
+            ),
+            "dataMissingCases": sum(
+                c.flag_data_missing for c in active
+            ),
+            "missingDelayReason": sum(
+                c.flag_overdue for c in active
+            ),
+            "awaitingUrgentAcceptance": sum(
+                c.routing_status
+                == RoutingStatus.AWAITING_ACCEPTANCE.value
+                for c in active
+            ),
+            "urgentRoutingExceptions": sum(
+                c.routing_status == RoutingStatus.EXCEPTION.value
+                for c in active
+            ),
         },
         "byStatus": by_status,
-        "referrals": _referral_counts(referrals),
+        "priorityCases": priority_cases,
+        "careProgress": care_progress,
+        "referrals": referral_overview,
+        "recentActivity": recent_activity,
     }
+
 
 def _referring_view(db, user, now):
     # Cases the clinician is the named owner of. "Cases awaiting clinical review" is not defined yet, so it is not reported.
