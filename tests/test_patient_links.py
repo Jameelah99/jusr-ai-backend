@@ -62,7 +62,8 @@ def test_unknown_and_expired_tokens(client, org):
 
 def test_patient_view_is_limited_to_what_the_patient_needs(client, org):
     d = client.get(f"/p/{token(client, org)}").json()["data"]
-    assert set(d) == {"patient", "facility", "screening", "nextAction", "dueAt", "expiresAt", "responses"}
+    assert set(d) == {"patient", "facility", "screening", "nextAction", "dueAt", "expiresAt", "responses",
+                      "status", "priority", "urgencyText", "contact", "language", "reassuranceAvailable", "progress"}
     assert d["patient"] == {"displayLabel": "PA"} and d["facility"] == {"name": "A"}
     assert "CB" not in str(d) and "PB" not in str(d)
 

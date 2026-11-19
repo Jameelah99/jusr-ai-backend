@@ -8,7 +8,10 @@ from app.core.database import get_db
 from app.api.v1.deps import worklist_user
 from app.core.permissions import visible_cases
 from app.services import routing, state_machine as sm
-from app.models.entities import Case, Patient, Screening, Facility, User, Priority, CaseStatus, RoutingStatus
+from app.models.entities import (
+    Case, Patient, Screening, Facility, User, Priority,
+    CaseStatus, RoutingStatus, Closure,
+)
 
 router = APIRouter()
 
@@ -38,7 +41,26 @@ def get_worklist(page: int = Query(1, ge=1), pageSize: int = Query(20, ge=1, le=
     sm.sync_overdue(db, base.filter(Case.status != CaseStatus.CLOSED, Case.flag_overdue.is_(False), Case.due_at < now).all(), now)
     db.commit()
     q = db.query(Case).join(Patient, Case.patient_id == Patient.id).outerjoin(Screening, Case.screening_id == Screening.id)
-    q = visible_cases(q, user)
+    visible_case_ids = visible_cases(
+        db.query(Case.id),
+        user,
+    ).subquery()
+
+    pending_approval_case_ids = (
+        db.query(Closure.case_id)
+        .filter(
+            Closure.second_approver_id == user.id,
+            Closure.status == "PENDING_SIGNOFF",
+        )
+        .subquery()
+    )
+
+    q = q.filter(
+        or_(
+            Case.id.in_(visible_case_ids),
+            Case.id.in_(pending_approval_case_ids),
+        )
+    )
     if not includeClosed and status is None: q = q.filter(Case.status != CaseStatus.CLOSED)
     if TABS[tab] is not None: q = q.filter(TABS[tab])
     if facilityId: q = q.filter(Case.facility_id == facilityId)
@@ -71,13 +93,58 @@ def get_worklist(page: int = Query(1, ge=1), pageSize: int = Query(20, ge=1, le=
         screening = db.get(Screening, c.screening_id) if c.screening_id else None
         owner = db.get(User, c.coordinator_id) if c.coordinator_id else None
         facility = db.get(Facility, c.facility_id)
+        closure = (
+            db.query(Closure)
+            .filter(Closure.case_id == c.id)
+            .order_by(Closure.requested_at.desc())
+            .first()
+        )
+
+        closure_requester = (
+            db.get(User, closure.closed_by_id)
+            if closure and closure.closed_by_id
+            else None
+        )
+        closure_approver = (
+            db.get(User, closure.second_approver_id)
+            if closure and closure.second_approver_id
+            else None
+        )
+
+        closure_out = (
+            {
+                "id": closure.id,
+                "status": closure.status,
+                "closureType": closure.closure_type,
+                "reason": closure.reason,
+                "closedById": closure.closed_by_id,
+                "closedByName": (
+                    closure_requester.display_name if closure_requester else None
+                ),
+                "secondApproverId": closure.second_approver_id,
+                "secondApproverName": (
+                    closure_approver.display_name if closure_approver else None
+                ),
+                "secondSignOffById": closure.second_signoff_by_id,
+                "requestedAt": closure.requested_at,
+                "closedAt": closure.closed_at,
+            }
+            if closure
+            else None
+        )
         owner_out = {"id": owner.id, "displayName": owner.display_name, "role": owner.role.value} if owner else None
         results.append({
             "id": c.id, "caseId": c.case_number, "trackerId": c.tracker_id,
-            "patient": {"id": patient.id, "displayLabel": patient.display_label, "ageYears": patient.age_years, "sex": patient.sex},
+            "patient": {
+                "id": patient.id,
+                "recordNumber": patient.record_number,
+                "displayLabel": patient.display_label,
+                "ageYears": patient.age_years,
+                "sex": patient.sex,
+            },
             "patientInitials": _initials(patient.display_label),
             "screening": ({"id": screening.id, "type": screening.screening_type, "outcome": screening.outcome, "displayLabel": screening.display_label} if screening else None),
-            "priority": c.priority.value, "status": c.status.value, "flags": sm.flags_of(c),
+            "priority": c.priority.value, "status": c.status.value, "closure": closure_out, "flags": sm.flags_of(c),
             "assignedCoordinator": owner_out, "owner": owner_out,
             "facility": {"id": facility.id, "name": facility.name},
             "nextAction": ({"code": c.next_action_code, "label": c.next_action_label} if c.next_action_code or c.next_action_label else None),

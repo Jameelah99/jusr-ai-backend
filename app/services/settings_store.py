@@ -23,6 +23,8 @@ DEFAULTS.update({
     "message.retry_minutes": [60, 300, 1080],  # ...over 24 hours (1 h, 5 h, 18 h after the previous attempt)
     "closure.unreachable_min_attempts": 3,  # R-55 placeholder
     "closure.unreachable_min_routes": 2,
+    "closure.unreachable_window_days": 7,   # R-55: attempts must fall inside this window
+    "reminder.ack_schedule_approved": False,  # R-32: the facility approves the reminder schedule once
     "feed.expected_interval_hours": None,   # R-26: unset means the feed monitor ignores the facility
     "baseline.m1_median_hours": 72, "baseline.m1_p90_hours": 168, "baseline.m2_acknowledged_share": 0.4,
     "baseline.m2_understood_share": 0.5, "baseline.m3_referral_accepted_share": 0.55, "baseline.m3_attended_share": 0.6,

@@ -9,6 +9,7 @@ import logging
 from app.core.config import settings
 from app.core.database import SessionLocal
 from app.services.messaging import get_message_provider, process_due_messages
+from app.services.reminders import process_ack_reminders
 from app.services.routing import SYSTEM_ACTOR, process_due_routing
 from app.services import state_machine as sm
 from app.services.workflow import process_referral_timeouts
@@ -43,6 +44,7 @@ def run_once(session_factory=SessionLocal) -> dict:
     """One pass over everything that may be due. Never raises; failures are logged and rolled back."""
     result = {}
     for name, job in (("messages", lambda db: process_due_messages(db, SYSTEM_ACTOR, get_message_provider())),
+                      ("ackReminders", lambda db: process_ack_reminders(db, SYSTEM_ACTOR, get_message_provider())),
                       ("urgentRouting", lambda db: process_due_routing(db, SYSTEM_ACTOR)),
                       ("overdue", lambda db: sm.process_overdue(db)),
                       ("referralTimeouts", lambda db: process_referral_timeouts(db)),

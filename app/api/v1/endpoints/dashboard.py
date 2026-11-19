@@ -10,6 +10,7 @@ from app.models.entities import (
     Case,
     Priority,
     CaseStatus,
+    Closure,
     Referral,
     Role,
     RoutingStatus,
@@ -231,20 +232,94 @@ def _coordinator_view(db, user, now):
 
 
 def _referring_view(db, user, now):
-    # Cases the clinician is the named owner of. "Cases awaiting clinical review" is not defined yet, so it is not reported.
-    owned = [c for c in visible_cases(db.query(Case), user).all() if c.coordinator_id == user.id]
-    sm.sync_overdue(db, [c for c in owned if c.status != CaseStatus.CLOSED], now); db.commit()
+    visible = visible_cases(db.query(Case), user).all()
+
+    owned = [c for c in visible if c.coordinator_id == user.id]
+
+    sm.sync_overdue(
+        db,
+        [c for c in owned if c.status != CaseStatus.CLOSED],
+        now,
+    )
+    db.commit()
+
     active = _open(owned)
     ids = [c.id for c in owned]
-    referrals = db.query(Referral).filter(Referral.case_id.in_(ids)).all() if ids else []
+    visible_ids = [c.id for c in visible]
+
+    referrals = (
+        db.query(Referral)
+        .filter(Referral.case_id.in_(ids))
+        .all()
+        if ids else []
+    )
+
+    # Closures specifically assigned to this clinician for second sign-off.
+    pending_closures_query = (
+        db.query(Closure)
+        .join(Case, Closure.case_id == Case.id)
+        .filter(
+            Closure.second_approver_id == user.id,
+            Closure.status == "PENDING_SIGNOFF",
+        )
+    )
+
+    if user.facility_id:
+        pending_closures_query = pending_closures_query.filter(
+            Case.facility_id == user.facility_id
+        )
+    else:
+        pending_closures_query = pending_closures_query.filter(
+            Case.id.in_(visible_ids)
+        )
+
+    pending_closures = (
+        pending_closures_query
+        .order_by(Closure.requested_at.desc())
+        .all()
+    )
+
+    closure_approvals = []
+
+    for closure in pending_closures:
+        case = db.get(Case, closure.case_id)
+        if not case:
+            continue
+
+        patient = db.get(Patient, case.patient_id)
+        requester = (
+            db.get(User, closure.closed_by_id)
+            if closure.closed_by_id else None
+        )
+
+        closure_approvals.append({
+            "id": case.id,
+            "caseNumber": case.case_number,
+            "patientLabel": (
+                patient.display_label if patient
+                else "Unknown patient"
+            ),
+            "closureType": closure.closure_type,
+            "reason": closure.reason,
+            "requestedBy": (
+                requester.display_name if requester
+                else "Authorised staff"
+            ),
+            "requestedAt": closure.requested_at,
+        })
+
     return {
         "stats": {
             "assignedCases": len(active),
-            "urgentCases": sum(c.priority == Priority.URGENT for c in active),
+            "urgentCases": sum(
+                c.priority == Priority.URGENT for c in active
+            ),
             "overdueCases": sum(c.flag_overdue for c in active),
             "missingDelayReason": sum(c.flag_overdue for c in active),
+            "closuresAwaitingSignOff": len(closure_approvals),
         },
         "referrals": _referral_counts(referrals),
+        "closureApprovals": closure_approvals,
     }
 
 def _receiving_view(db, user, now):

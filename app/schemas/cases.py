@@ -118,10 +118,16 @@ class CloseBody(BaseModel):
     reason: RequiredText
     decision: str | None = Field(default=None, max_length=2000)
     evidence: str | None = Field(default=None, max_length=2000)
+    secondApproverId: str | None = None
 
     @field_validator("decision", "evidence")
     @classmethod
     def blank(cls, v):
+        return _clean(v)
+
+    @field_validator("secondApproverId")
+    @classmethod
+    def clean_approver_id(cls, v):
         return _clean(v)
 
 class LinkedCaseBody(BaseModel):

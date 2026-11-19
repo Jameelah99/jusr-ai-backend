@@ -220,9 +220,9 @@ class Seeder:
 
     def s_unreachable(self, i):
         c = self.start("S10 unreachable and closed"); self.classify(c); self.to_ack(c, respond=False)
+        self.d.wait(days=8)
         for route in ("PHONE", "PHONE", "SMS"):
             self.d.call("coord", "POST", f"/cases/{c}/contact-attempts", json={"route": route, "outcome": "NOT_REACHED", "note": "No answer"}); self.d.wait(days=1)
-        self.d.wait(days=8)
         self.d.call("coord", "POST", f"/cases/{c}/assign", json={"ownerId": self.d.ids["refer"]})  # the clinician who decides becomes the named owner
         self.d.call("refer", "POST", f"/cases/{c}/close", json={"closureType": "UNREACHABLE", "reason": "Patient could not be reached", "decision": "Close as unreachable", "evidence": "3 attempts on 2 routes"})
 

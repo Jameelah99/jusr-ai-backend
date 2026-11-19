@@ -5,3 +5,6 @@ __pycache__/
 *.py[cod]
 .coverage
 htmlcov/
+
+# deliverable archive, not source
+backend.zip

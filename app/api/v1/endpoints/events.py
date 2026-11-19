@@ -3,7 +3,7 @@ import csv, io, json
 from datetime import datetime
 from typing import Literal
 from uuid import uuid4
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
@@ -281,6 +281,60 @@ def post_events(body: BatchBody, db: Session = Depends(get_db), user=Depends(req
     out = [ingest(db, user, e, raise_on_error=False) for e in body.events]
     counts = {s: sum(1 for o in out if o["status"] == s) for s in ("ACCEPTED", "DUPLICATE", "REJECTED")}
     return {"success": True, "data": {"results": out, "counts": counts}, "meta": {}}
+
+CSV_FIELDS = ("patientId", "caseId", "testCode", "testName", "testValue", "abnormal", "issuedAt", "screeningType", "outcome",
+              "confirmatoryRequired", "scheduledAt", "attendance", "reasonCode", "note", "startDate", "kind", "attachmentRef", "newFacilityId")
+
+
+@router.post("/csv")
+async def post_events_csv(request: Request, db: Session = Depends(get_db), user=Depends(require_roles("COORDINATOR", "NATIONAL_ADMIN"))):
+    """R-24/R-25: import a CSV file of inbound events. Every row goes through the same validation as the API,
+    so an unreadable row is refused and listed without stopping the rest. Columns: eventId, type, facilityId,
+    occurredAt (optional) and payload (optional JSON). Common event fields may also be their own columns."""
+    raw = (await request.body()).decode("utf-8-sig", errors="replace")
+    reader = csv.DictReader(io.StringIO(raw))
+    if not reader.fieldnames:
+        raise HTTPException(422, detail={"code": "EMPTY_CSV", "message": "The CSV has no header row"})
+    missing = {"eventId", "type", "facilityId"} - {f.strip() for f in reader.fieldnames}
+    if missing:
+        raise HTTPException(422, detail={"code": "MISSING_COLUMNS", "message": f"The CSV is missing: {', '.join(sorted(missing))}"})
+
+    results = []
+    for index, row in enumerate(reader, start=2):
+        if index > 501:
+            results.append({"row": index, "status": "REJECTED", "code": "TOO_MANY_ROWS", "message": "Only 500 rows are processed per file"})
+            break
+        clean = {str(k).strip(): (v.strip() if isinstance(v, str) else v) for k, v in row.items() if k}
+        if not any(clean.values()):
+            continue
+        payload = {}
+        if clean.get("payload"):
+            try:
+                payload = json.loads(clean["payload"])
+            except (TypeError, ValueError):
+                results.append({"row": index, "status": "REJECTED", "code": "INVALID_PAYLOAD", "message": "payload is not valid JSON"})
+                continue
+            if not isinstance(payload, dict):
+                results.append({"row": index, "status": "REJECTED", "code": "INVALID_PAYLOAD", "message": "payload must be a JSON object"})
+                continue
+        for field in CSV_FIELDS:
+            if clean.get(field) not in (None, ""):
+                payload.setdefault(field, clean[field])
+        if "abnormal" in payload and isinstance(payload["abnormal"], str):
+            payload["abnormal"] = payload["abnormal"].strip().lower() in ("1", "true", "yes", "y")
+        if "confirmatoryRequired" in payload and isinstance(payload["confirmatoryRequired"], str):
+            payload["confirmatoryRequired"] = payload["confirmatoryRequired"].strip().lower() in ("1", "true", "yes", "y")
+        try:
+            body = InboundBody(eventId=clean.get("eventId") or f"CSV-{uuid4().hex[:10].upper()}", type=clean["type"], facilityId=clean["facilityId"] or None,
+                               occurredAt=clean.get("occurredAt") or None, payload=payload)
+        except Exception as exc:  # pydantic validation: an unknown type or malformed date
+            results.append({"row": index, "status": "REJECTED", "code": "INVALID_ROW", "message": str(exc).splitlines()[0][:300]})
+            continue
+        outcome = ingest(db, user, body, raise_on_error=False)
+        results.append({"row": index, **outcome})
+
+    counts = {s: sum(1 for o in results if o["status"] == s) for s in ("ACCEPTED", "DUPLICATE", "REJECTED")}
+    return {"success": True, "data": {"results": results, "counts": counts}, "meta": {}}
 
 # ---------------------------------------------------------------- rejected items, export
 

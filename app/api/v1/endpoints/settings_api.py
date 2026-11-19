@@ -5,10 +5,11 @@ from sqlalchemy.orm import Session
 from app.core import clock
 from app.core.database import get_db
 from app.api.v1.deps import require_roles
-from app.models.entities import Facility, Role, RoutingRule, Setting
+from app.models.entities import Facility, Role, RoutingRule, Setting, SpecialtyBackup, User
 from app.services import settings_store
 from app.services import state_machine as sm
 from app.services.audit import record_event
+from app.services.routing import normalize_specialty
 
 router = APIRouter()
 VIEW = require_roles("COORDINATOR", "REFERRING_CLINICIAN", "RECEIVING_CLINICIAN", "FACILITY_ADMIN", "NATIONAL_ADMIN")
@@ -76,6 +77,64 @@ def delete_setting(key: str, scope: str = Query("global"), db: Session = Depends
     if key.startswith("limit."): sm.refresh_due_dates(db, key.split(".", 1)[1])
     db.commit()
     return {"success": True, "data": {"key": key, "scope": scope, "removed": True}, "meta": {}}
+
+# ---------------------------------------------------------------- named specialty backups (R-29)
+
+class BackupBody(BaseModel):
+    clinicianId: str
+
+
+def _backup_out(db, row: SpecialtyBackup):
+    clinician = db.get(User, row.clinician_id)
+    return {"specialty": row.specialty, "clinicianId": row.clinician_id, "clinicianName": clinician.display_name if clinician else None,
+            "facilityId": row.facility_id, "changedById": row.changed_by_id, "changedAt": row.changed_at}
+
+
+@router.get("/specialty-backups")
+def list_specialty_backups(db: Session = Depends(get_db), user=Depends(VIEW)):
+    rows = db.query(SpecialtyBackup).order_by(SpecialtyBackup.specialty).all()
+    return {"success": True, "data": [_backup_out(db, r) for r in rows], "meta": {}}
+
+
+@router.put("/specialty-backups/{specialty}")
+def put_specialty_backup(specialty: str, body: BackupBody, db: Session = Depends(get_db), user=Depends(EDIT)):
+    """Name the backup clinician for a specialty. The second escalation prefers this person (R-29)."""
+    name = normalize_specialty(specialty)
+    if not name:
+        raise HTTPException(422, "Give a specialty name")
+    clinician = db.get(User, body.clinicianId)
+    if not clinician or clinician.role != Role.RECEIVING_CLINICIAN or not clinician.is_active:
+        raise HTTPException(422, detail={"code": "INVALID_BACKUP", "message": "The backup must be an active receiving clinician"})
+    if clinician.specialty != name:
+        raise HTTPException(422, detail={"code": "SPECIALTY_MISMATCH", "message": f"{clinician.specialty or 'No specialty'} does not match {name}"})
+    if user.role == Role.FACILITY_ADMIN:
+        fac = db.get(Facility, clinician.facility_id) if clinician.facility_id else None
+        if not fac or not (fac.id == user.facility_id or fac.created_by_id == user.id):
+            raise HTTPException(403, "A facility administrator can only name staff from their own facilities")
+    row = db.query(SpecialtyBackup).filter(SpecialtyBackup.specialty == name).first()
+    old = row.clinician_id if row else None
+    if row:
+        row.clinician_id = clinician.id; row.facility_id = clinician.facility_id; row.changed_by_id = user.id; row.changed_at = clock.now()
+    else:
+        row = SpecialtyBackup(specialty=name, clinician_id=clinician.id, facility_id=clinician.facility_id, changed_by_id=user.id, changed_at=clock.now())
+        db.add(row)
+    record_event(db, user, case_id=None, event_type="SPECIALTY_BACKUP_CHANGED", description=f"Specialty backup set for {name}",
+                 old_values={"specialty": name, "clinicianId": old}, new_values={"specialty": name, "clinicianId": clinician.id})
+    db.commit()
+    return {"success": True, "data": _backup_out(db, row), "meta": {}}
+
+
+@router.delete("/specialty-backups/{specialty}")
+def delete_specialty_backup(specialty: str, db: Session = Depends(get_db), user=Depends(EDIT)):
+    name = normalize_specialty(specialty)
+    row = db.query(SpecialtyBackup).filter(SpecialtyBackup.specialty == name).first()
+    if not row:
+        raise HTTPException(404, "No backup is named for that specialty")
+    record_event(db, user, case_id=None, event_type="SPECIALTY_BACKUP_CHANGED", description=f"Specialty backup removed for {name}",
+                 old_values={"specialty": name, "clinicianId": row.clinician_id})
+    db.delete(row); db.commit()
+    return {"success": True, "data": {"specialty": name, "removed": True}, "meta": {}}
+
 
 # ---------------------------------------------------------------- routing table (R-27)
 

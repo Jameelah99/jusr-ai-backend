@@ -84,6 +84,13 @@ def view_link(token: str, session: str | None = SessionHeader, db: Session = Dep
     screening = db.get(Screening, case.screening_id) if case.screening_id else None
     facility = db.get(Facility, case.facility_id)
     db.commit()
+    status = case.status.value
+    priority = case.priority.value
+    urgency_text = {
+        "URGENT": "Your care team has been asked to act on this result urgently.",
+        "HIGH": "This result needs attention soon.",
+    }.get(priority, "Your care team is following up as planned.")
+    reassurance_available = case.status in (CaseStatus.AWAITING_TREATMENT, CaseStatus.READY_TO_CLOSE, CaseStatus.CLOSED)
     # Only what the patient needs: no age, sex, ids of other records, coordinator or workflow detail.
     return {
         "success": True,
@@ -94,6 +101,13 @@ def view_link(token: str, session: str | None = SessionHeader, db: Session = Dep
             "nextAction": {"label": case.next_action_label} if case.next_action_label else None,
             "dueAt": case.due_at,
             "expiresAt": link.expires_at,
+            "status": status,
+            "priority": priority,
+            "urgencyText": urgency_text,
+            "contact": _contact(db, case, facility),
+            "language": patient.preferred_language or "en",
+            "reassuranceAvailable": reassurance_available,
+            "progress": _progress(case),
             "responses": {
                 "acknowledged": "ACKNOWLEDGEMENT" in latest,
                 "understood": (latest.get("UNDERSTANDING") or {}).get("understood"),

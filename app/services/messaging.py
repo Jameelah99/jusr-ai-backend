@@ -23,7 +23,7 @@ def get_message_provider():
 
 def attempt_delivery(db, user, message: Message, provider) -> Message:
     """One delivery attempt for an APPROVED or due RETRYING message. Caller commits."""
-    assert message.status in (MessageStatus.APPROVED.value, MessageStatus.RETRYING.value) and message.approved_by_id
+    assert message.status in (MessageStatus.APPROVED.value, MessageStatus.RETRYING.value) and (message.approved_by_id or message.source == "SYSTEM")
     now = clock.now()
     message.attempts += 1
     case = db.get(Case, message.case_id)

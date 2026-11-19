@@ -176,6 +176,7 @@ def test_scheduler_pass_never_raises(client):
 
     assert result == {
         "messages": {"error": True},
+        "ackReminders": {"error": True},
         "urgentRouting": {"error": True},
         "overdue": {"error": True},
         "referralTimeouts": {"error": True},

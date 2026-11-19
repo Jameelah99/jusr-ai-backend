@@ -549,6 +549,20 @@ def approved_summary(
     }
 
 
+@router.get("/facilities")
+def list_facilities_for_ai(
+    db: Session = Depends(get_db),
+    user=Depends(require_roles(Role.AI_SERVICE.value)),
+):
+    """Read-only facility map for the AI helper service, so referral suggestions use real facility IDs."""
+    rows = db.query(Facility).order_by(Facility.name).all()
+    return {
+        "success": True,
+        "data": [{"id": f.id, "code": f.code, "name": f.name} for f in rows],
+        "meta": {},
+    }
+
+
 @router.get("/{suggestion_id}")
 def get_suggestion(
     suggestion_id: str, db: Session = Depends(get_db), user=Depends(clinical_user)

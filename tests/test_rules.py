@@ -35,9 +35,9 @@ def test_unreachable_needs_attempts_on_two_routes(d):
     body = {"closureType": "UNREACHABLE", "reason": "No answer", "decision": "Close as unreachable", "evidence": "attempts"}
     r = d.c.post("/api/v1/cases/C-1/close", headers=d.auth("refer"), json=body)
     assert r.status_code == 422 and err(r) == "EVIDENCE_REQUIRED"
+    d.wait(days=8)
     for route in ("PHONE", "PHONE", "SMS"):
         d.call("coord", "POST", "/cases/C-1/contact-attempts", json={"route": route, "outcome": "NOT_REACHED"})
-    d.wait(days=8)
     d.call("refer", "POST", "/cases/C-1/close", json=body)
     assert d.call("refer", "GET", "/cases/C-1")["status"] == "CLOSED"
 

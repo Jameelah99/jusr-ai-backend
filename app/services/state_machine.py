@@ -6,6 +6,7 @@ nothing and writes a log entry (R-12). Every successful one writes a CASE_TRANSI
 calculated from those events.
 """
 from dataclasses import dataclass, field
+from datetime import timedelta
 from types import SimpleNamespace
 from app.core import clock
 from app.models.entities import (Case, CaseStatus, Closure, ClosureType, Consultation, ConsultationState, ContactAttempt, Priority, ReferralStatus,
@@ -137,18 +138,41 @@ def closure_checklist(db, case: Case, closure_type: ClosureType, *, decision=Non
         item("A documented informed refusal", evidence)
         item("The clinician's decision", decision)
     elif closure_type == ClosureType.UNREACHABLE:
-        attempts = db.query(ContactAttempt).filter(ContactAttempt.case_id == case.id).all()
         need_n = settings_store.get_int(db, "closure.unreachable_min_attempts", facility_id=case.facility_id)
         need_r = settings_store.get_int(db, "closure.unreachable_min_routes", facility_id=case.facility_id)
+        window_days = settings_store.get_int(db, "closure.unreachable_window_days", facility_id=case.facility_id)
+
+        # R-55: only attempts inside the window count, so an old attempt cannot satisfy the rule.
+        q = db.query(ContactAttempt).filter(ContactAttempt.case_id == case.id)
+        if window_days:
+            q = q.filter(ContactAttempt.created_at >= clock.now() - timedelta(days=window_days))
+        attempts = q.all()
+
         routes = {a.route for a in attempts}
-        item(f"At least {need_n} logged contact attempts (found {len(attempts)})", len(attempts) >= need_n, {"attemptIds": [a.id for a in attempts]})
+
+        item(f"At least {need_n} logged contact attempts in the last {window_days} days (found {len(attempts)})", len(attempts) >= need_n, {"attemptIds": [a.id for a in attempts]})
         item(f"Attempts by at least {need_r} routes (found {len(routes)})", len(routes) >= need_r)
         item("The clinician's decision", decision)
     elif closure_type == ClosureType.MOVED_OR_TRANSFERRED:
         accepted = db.query(Referral).filter(Referral.case_id == case.id, Referral.status == ReferralStatus.ACCEPTED.value).first()
         item("The receiving provider's acceptance, or a documented hand-off", accepted or evidence, {"referralId": accepted.id} if accepted else None)
     elif closure_type == ClosureType.OTHER:
-        item("A second authorised person's sign-off", False)
+        approved_closure = (
+            db.query(Closure)
+            .filter(
+                Closure.case_id == case.id,
+                Closure.closure_type == ClosureType.OTHER.value,
+                Closure.status == "CLOSED",
+                Closure.second_signoff_by_id.isnot(None),
+            )
+            .order_by(Closure.requested_at.desc())
+            .first()
+        )
+        item(
+            "A second authorised person's sign-off",
+            approved_closure is not None,
+            {"closureId": approved_closure.id} if approved_closure else None,
+        )
     return items
 
 def missing_for_closure(db, case, closure_type, **kw) -> list[str]:

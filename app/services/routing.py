@@ -10,7 +10,7 @@ Every step writes an audit event.
 from datetime import timedelta
 from fastapi import HTTPException
 from app.core import clock
-from app.models.entities import Case, CaseStatus, Priority, Role, RoutingStatus, Task, User
+from app.models.entities import Case, CaseStatus, Priority, Role, RoutingStatus, SpecialtyBackup, Task, User
 from app.services import settings_store
 from app.services.audit import record_event, reject_and_log
 from app.services.tasks import create_task
@@ -138,6 +138,26 @@ def accept_case(db, user, case: Case) -> Case:
     _close_routing_tasks(db, case, now)
     return case
 
+def _named_backup_id(db, specialty: str | None) -> str | None:
+    if not specialty:
+        return None
+    row = db.query(SpecialtyBackup).filter(SpecialtyBackup.specialty == specialty).first()
+    return row.clinician_id if row else None
+
+
+def _named_backup(db, case: Case) -> User | None:
+    """R-29: the named backup for the case's specialty, if set and still valid."""
+    row = db.query(SpecialtyBackup).filter(SpecialtyBackup.specialty == case.required_specialty).first()
+    if not row:
+        return None
+    user = db.get(User, row.clinician_id)
+    if not user or not user.is_active or user.role != Role.RECEIVING_CLINICIAN or user.specialty != case.required_specialty:
+        return None
+    if user.id in (case.routing_tried or []):
+        return None
+    return user
+
+
 def process_due_routing(db, actor, case_query=None, now=None) -> dict:
     """Apply expired acceptance limits. Safe to call repeatedly; each case advances one step per call."""
     now = now or _now()
@@ -158,13 +178,17 @@ def process_due_routing(db, actor, case_query=None, now=None) -> dict:
                          new_values={"routedClinicianId": case.routed_clinician_id, "nextDueAt": case.routing_due_at.isoformat()})
             counts["escalated"] += 1
         elif case.routing_stage == 1:
-            backups = qualified_clinicians(db, case.required_specialty, exclude=case.routing_tried or [], prefer_facility=case.facility_id)
-            if backups:
-                previous = case.routed_clinician_id; backup = backups[0]
+            backup = _named_backup(db, case)
+            if backup is None:
+                backups = qualified_clinicians(db, case.required_specialty, exclude=case.routing_tried or [], prefer_facility=case.facility_id)
+                backup = backups[0] if backups else None
+            if backup:
+                previous = case.routed_clinician_id
                 case.routed_clinician_id = backup.id; case.routing_stage = 2; case.routing_tried = list(case.routing_tried or []) + [backup.id]
                 case.routing_due_at = now + timedelta(minutes=first); case.updated_at = now
-                record_event(db, actor, case_id=case.id, event_type="URGENT_ROUTING_REASSIGNED", description="Second limit expired; routed to a backup clinician",
-                             old_values={"routedClinicianId": previous}, new_values={"routedClinicianId": backup.id, "reason": "SECOND_LIMIT_EXPIRED", "dueAt": case.routing_due_at.isoformat()})
+                record_event(db, actor, case_id=case.id, event_type="URGENT_ROUTING_REASSIGNED", description="Second limit expired; routed to the specialty backup clinician",
+                             old_values={"routedClinicianId": previous}, new_values={"routedClinicianId": backup.id, "reason": "SECOND_LIMIT_EXPIRED", "dueAt": case.routing_due_at.isoformat(),
+                                                                                    "namedBackup": _named_backup_id(db, case.required_specialty) == backup.id})
                 counts["reassigned"] += 1
             else:
                 case.updated_at = now

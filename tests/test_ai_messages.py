@@ -50,6 +50,14 @@ def test_only_the_ai_service_submits(client, org):
         r = submit(client, org, "URGENCY", {"priority": "NORMAL", "actionability": "ACTIONABLE", "rationale": "r"}, who=who)
         assert r.status_code == 403, who
 
+def test_ai_service_reads_the_facility_map_for_referral_suggestions(client, org):
+    r = client.get("/api/ai/suggestions/facilities", headers=org["auth"]("ai"))
+    assert r.status_code == 200, r.text
+    rows = r.json()["data"]
+    assert {row["code"] for row in rows} == {"JUSR-DEMO", "DEMO-RRH", "DEMO-DC"}
+    assert all(row["id"] and row["name"] for row in rows)
+    assert client.get("/api/ai/suggestions/facilities", headers=org["auth"]("coord")).status_code == 403
+
 def test_submission_validation(client, org):
     good = {"priority": "NORMAL", "actionability": "ACTIONABLE", "rationale": "r"}
     err(submit(client, org, "URGENCY", {"priority": "NORMAL"}), 422, "INVALID_SUGGESTION_PAYLOAD")

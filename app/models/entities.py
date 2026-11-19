@@ -408,6 +408,16 @@ class Setting(Base):
     changed_by_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
     changed_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=_now)
 
+class SpecialtyBackup(Base):
+    """R-29: the clinician named as backup for a specialty; the second escalation tries them first."""
+    __tablename__ = "specialty_backups"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    specialty: Mapped[str] = mapped_column(String(60), unique=True, index=True)
+    clinician_id: Mapped[str] = mapped_column(ForeignKey("users.id"))
+    facility_id: Mapped[str | None] = mapped_column(ForeignKey("facilities.id"), nullable=True)
+    changed_by_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    changed_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=_now)
+
 class DelayFollowup(Base):
     """R-18: staff follow-up with a reason-for-delay code on an OVERDUE case or a missed appointment."""
     __tablename__ = "delay_followups"
@@ -482,6 +492,10 @@ class Closure(Base):
     evidence: Mapped[str | None] = mapped_column(Text, nullable=True)
     closed_by_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
     second_signoff_by_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    second_approver_id: Mapped[str | None] = mapped_column(
+    ForeignKey("users.id"),
+    nullable=True,
+    )
     transition_id: Mapped[str | None] = mapped_column(String(4), nullable=True)
     requested_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=_now)
     closed_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)

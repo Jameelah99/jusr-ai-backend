@@ -188,62 +188,220 @@ def _finish_closure(db, actor, case: Case, closure: Closure, *, second=None):
     for t in db.query(Task).filter(Task.case_id == case.id, Task.status == "OPEN").all():
         t.status = "DONE"; t.completed_at = now  # nothing is left open on a closed case
 
+
 @router.post("/{case_id}/close")
 def close_case(case_id: str, payload: CloseBody, db: Session = Depends(get_db), user=Depends(clinical_user)):
     case = load_case(db, user, case_id)
     tid = _tid(case)
+
     if case.status == CaseStatus.CLOSED:
         reject_and_log(db, user, case_id=case.id, attempted=tid, status_code=409, code="CASE_CLOSED", message="A closed case is read-only (R-56)")
+
     if user.role.value in ("AI_SERVICE", "SYSTEM", "PATIENT", "FACILITY_ADMIN"):
         reject_and_log(db, user, case_id=case.id, attempted=tid, status_code=403, code="CLOSURE_IS_HUMAN", message="Closure is a human act; the AI service and the system cannot close a case (R-15)")
+
     if not sm.can_close(user, case, payload.closureType):
         reject_and_log(db, user, case_id=case.id, attempted=tid, status_code=403, code="NOT_AUTHORISED_TO_CLOSE",
                        message="You cannot close this case this way: you need the authorised-to-close flag, or to be the named owner for a clinician's closure")
+
     if payload.closureType.value not in sm.valid_closure_types(case):
         reject_and_log(db, user, case_id=case.id, attempted=tid, status_code=422, code="INVALID_CLOSURE_TYPE", message=f"{payload.closureType.value} cannot be used while the case is {case.status.value}")
+
     if tid == "T17" and user.role.value not in sm.CLINICIANS | {sm.NAT}:
         reject_and_log(db, user, case_id=case.id, attempted=tid, status_code=403, code="ROLE_NOT_ALLOWED", message="Only a clinician can close a case before it is ready to close (T17)")
+
+    second_approver = None
+
+    if payload.closureType == ClosureType.OTHER:
+        if not payload.secondApproverId:
+            reject_and_log(db, user, case_id=case.id, attempted="close:request", status_code=422,
+                           code="SECOND_APPROVER_REQUIRED", message="Select a second authorised person to approve this closure (R-54)")
+
+        second_approver = db.get(User, payload.secondApproverId)
+
+        allowed_second_approver_roles = (
+            (Role.REFERRING_CLINICIAN,)
+            if tid == "T17"
+            else (Role.COORDINATOR, Role.REFERRING_CLINICIAN)
+        )
+
+        if (
+            not second_approver
+            or not second_approver.is_active
+            or second_approver.id == user.id
+            or second_approver.facility_id != case.facility_id
+            or second_approver.role not in allowed_second_approver_roles
+            or not second_approver.authorised_to_close
+        ):
+            reject_and_log(
+                db,
+                user,
+                case_id=case.id,
+                attempted="close:request",
+                status_code=422,
+                code="INVALID_SECOND_APPROVER",
+                message="The second approver must be a different, active, authorised person at this facility with a role permitted for this closure transition",
+            )
+
     if case.flag_data_missing:
         reject_and_log(db, user, case_id=case.id, attempted=tid, status_code=409, code="DATA_MISSING", message="Data missing: a facility feed is missing or incomplete, so this case cannot be closed yet (R-14)")
+
     missing = sm.missing_for_closure(db, case, payload.closureType, decision=payload.decision, evidence=payload.evidence, reason=payload.reason)
     if missing:
         reject_and_log(db, user, case_id=case.id, attempted=tid, status_code=422, code="EVIDENCE_REQUIRED",
                        message="Cannot close this case yet. Missing: " + "; ".join(missing) + " (rule A-01)")
+
     now = clock.now()
-    if payload.closureType == ClosureType.OTHER:  # R-54: held until a second authorised person approves
-        pending = db.query(Closure).filter(Closure.case_id == case.id, Closure.status == "PENDING_SIGNOFF").first()
+
+    if payload.closureType == ClosureType.OTHER:
+        pending = db.query(Closure).filter(
+            Closure.case_id == case.id,
+            Closure.status == "PENDING_SIGNOFF",
+        ).first()
+
+        if pending and pending.closed_by_id != user.id:
+            reject_and_log(db, user, case_id=case.id, attempted="close:request", status_code=409,
+                           code="CLOSURE_ALREADY_PENDING",
+                           message="Another user has already submitted a closure awaiting sign-off")
+
         if pending:
-            pending.reason = payload.reason; pending.decision = payload.decision; pending.evidence = payload.evidence; pending.closed_by_id = user.id; pending.requested_at = now
+            pending.reason = payload.reason
+            pending.decision = payload.decision
+            pending.evidence = payload.evidence
+            pending.closed_by_id = user.id
+            pending.second_approver_id = second_approver.id
+            pending.requested_at = now
         else:
-            pending = Closure(case_id=case.id, closure_type=payload.closureType.value, status="PENDING_SIGNOFF", reason=payload.reason, decision=payload.decision,
-                              evidence=payload.evidence, closed_by_id=user.id, requested_at=now)
+            pending = Closure(
+                case_id=case.id,
+                closure_type=payload.closureType.value,
+                status="PENDING_SIGNOFF",
+                reason=payload.reason,
+                decision=payload.decision,
+                evidence=payload.evidence,
+                closed_by_id=user.id,
+                second_approver_id=second_approver.id,
+                requested_at=now,
+            )
             db.add(pending)
-        record_event(db, user, case_id=case.id, event_type="CLOSURE_REQUESTED", description="Closure as OTHER requested; a second authorised person must approve (R-54)",
-                     new_values={"closureType": "OTHER", "reason": payload.reason})
+
+        record_event(
+            db,
+            user,
+            case_id=case.id,
+            event_type="CLOSURE_REQUESTED",
+            description="Closure as OTHER requested; a second authorised person must approve (R-54)",
+            new_values={
+                "closureType": "OTHER",
+                "reason": payload.reason,
+                "secondApproverId": second_approver.id,
+            },
+        )
         db.commit()
-        return {"success": True, "data": {"caseId": case.case_number, "status": case.status.value, "pendingSignOff": True,
-                                          "message": "A second authorised person must approve before the case closes"}, "meta": {}}
-    closure = Closure(case_id=case.id, closure_type=payload.closureType.value, status="PENDING_SIGNOFF", reason=payload.reason, decision=payload.decision,
-                      evidence=payload.evidence, closed_by_id=user.id, requested_at=now)
+
+        return {
+            "success": True,
+            "data": {
+                "caseId": case.case_number,
+                "status": case.status.value,
+                "pendingSignOff": True,
+                "secondApproverId": second_approver.id,
+                "message": "A second authorised person must approve before the case closes",
+            },
+            "meta": {},
+        }
+
+    closure = Closure(
+        case_id=case.id,
+        closure_type=payload.closureType.value,
+        status="PENDING_SIGNOFF",
+        reason=payload.reason,
+        decision=payload.decision,
+        evidence=payload.evidence,
+        closed_by_id=user.id,
+        requested_at=now,
+    )
     db.add(closure)
     _finish_closure(db, user, case, closure)
     db.commit()
-    return {"success": True, "data": {"caseId": case.case_number, "status": case.status.value, "closureType": case.closure_type, "closedAt": case.closed_at, "pendingSignOff": False}, "meta": {}}
+
+    return {
+        "success": True,
+        "data": {
+            "caseId": case.case_number,
+            "status": case.status.value,
+            "closureType": case.closure_type,
+            "closedAt": case.closed_at,
+            "pendingSignOff": False,
+        },
+        "meta": {},
+    }
+
 
 @router.post("/{case_id}/close/sign-off")
 def sign_off_closure(case_id: str, db: Session = Depends(get_db), user=Depends(clinical_user)):
-    """R-54: the second authorised person approves an 'Other' closure. Both names are logged."""
+    """R-54: only the specifically selected second authorised person can approve an 'Other' closure."""
     case = load_case(db, user, case_id)
-    closure = db.query(Closure).filter(Closure.case_id == case.id, Closure.status == "PENDING_SIGNOFF", Closure.closure_type == ClosureType.OTHER.value).first()
+
+    closure = db.query(Closure).filter(
+        Closure.case_id == case.id,
+        Closure.status == "PENDING_SIGNOFF",
+        Closure.closure_type == ClosureType.OTHER.value,
+    ).first()
+
     if not closure:
-        reject_and_log(db, user, case_id=case.id, attempted="close:sign-off", status_code=409, code="NOTHING_TO_SIGN_OFF", message="There is no closure waiting for a second sign-off")
+        reject_and_log(db, user, case_id=case.id, attempted="close:sign-off", status_code=409,
+                       code="NOTHING_TO_SIGN_OFF", message="There is no closure waiting for a second sign-off")
+
     if closure.closed_by_id == user.id:
-        reject_and_log(db, user, case_id=case.id, attempted="close:sign-off", status_code=403, code="SECOND_PERSON_REQUIRED", message="A second, different authorised person must approve (R-54)")
-    if not (user.authorised_to_close or user.role == Role.NATIONAL_ADMIN):
-        reject_and_log(db, user, case_id=case.id, attempted="close:sign-off", status_code=403, code="NOT_AUTHORISED_TO_CLOSE", message="The second person must have the authorised-to-close flag")
+        reject_and_log(db, user, case_id=case.id, attempted="close:sign-off", status_code=403,
+                       code="SECOND_PERSON_REQUIRED", message="A second, different authorised person must approve (R-54)")
+
+    if closure.second_approver_id != user.id:
+        reject_and_log(
+            db,
+            user,
+            case_id=case.id,
+            attempted="close:sign-off",
+            status_code=403,
+            code="NOT_SELECTED_APPROVER",
+            message="Only the person selected as the second approver can sign off this closure",
+        )
+
+    allowed_signoff_roles = (
+        (Role.REFERRING_CLINICIAN,)
+        if _tid(case) == "T17"
+        else (Role.COORDINATOR, Role.REFERRING_CLINICIAN)
+    )
+
+    if (
+        not user.is_active
+        or user.role not in allowed_signoff_roles
+        or not user.authorised_to_close
+    ):
+        reject_and_log(
+            db,
+            user,
+            case_id=case.id,
+            attempted="close:sign-off",
+            status_code=403,
+            code="NOT_AUTHORISED_TO_CLOSE",
+            message="The selected second person must be active, authorised, and permitted for this closure transition",
+        )
     _finish_closure(db, user, case, closure, second=user)
     db.commit()
-    return {"success": True, "data": {"caseId": case.case_number, "status": case.status.value, "closureType": case.closure_type, "closedAt": case.closed_at, "pendingSignOff": False}, "meta": {}}
+
+    return {
+        "success": True,
+        "data": {
+            "caseId": case.case_number,
+            "status": case.status.value,
+            "closureType": case.closure_type,
+            "closedAt": case.closed_at,
+            "pendingSignOff": False,
+        },
+        "meta": {},
+    }
 
 # ---------------------------------------------------------------- R-56: reopening is not allowed; start a new linked case
 

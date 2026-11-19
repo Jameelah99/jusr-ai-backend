@@ -1,8 +1,10 @@
 """Facility administration (section 5, A-11): facilities, staff profiles. The facility administrator sees staff and settings, never clinical content (R-09)."""
+import csv
+import io
 import re
 from typing import Literal
-from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 from app.core.database import get_db
@@ -73,6 +75,40 @@ def list_staff(facilityId: str | None = None, role: Role | None = None, specialt
     if specialty: q = q.filter(User.specialty == normalize_specialty(specialty))
     return {"success": True, "data": [staff_out(u) for u in q.order_by(User.display_name).all()], "meta": {}}
 
+@router.get("/closure-authorised-staff")
+def list_closure_authorised_staff(
+    db: Session = Depends(get_db),
+    user=Depends(require_roles("COORDINATOR", "REFERRING_CLINICIAN")),
+):
+    """Return active, authorised closure approvers within the user's facility."""
+    if not user.facility_id:
+        return {"success": True, "data": [], "meta": {}}
+
+    staff = (
+        db.query(User)
+        .filter(
+            User.facility_id == user.facility_id,
+            User.role.in_((Role.COORDINATOR, Role.REFERRING_CLINICIAN)),
+            User.authorised_to_close.is_(True),
+            User.is_active.is_(True),
+        )
+        .order_by(User.display_name)
+        .all()
+    )
+
+    return {
+        "success": True,
+        "data": [
+            {
+                "id": str(member.id),
+                "displayName": member.display_name,
+                "role": member.role.value,
+            }
+            for member in staff
+        ],
+        "meta": {},
+    }
+
 class StaffCreate(BaseModel):
     email: str = Field(pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$", max_length=255)
     displayName: str = Field(min_length=1, max_length=160)
@@ -110,6 +146,60 @@ def create_staff(body: StaffCreate, db: Session = Depends(get_db), user=Depends(
     record_event(db, user, case_id=None, event_type="STAFF_CREATED", description=f"Staff profile created: {u.display_name}", new_values=staff_out(u))
     db.commit()
     return {"success": True, "data": staff_out(u), "meta": {}}
+
+@router.post("/staff/csv")
+async def import_staff_csv(request: Request, db: Session = Depends(get_db), user=Depends(ADMIN)):
+    """Create staff profiles from a CSV (A-11). Columns: email, displayName, password, role, facilityId (optional),
+    specialty (optional), authorisedToClose (optional true/false). Each row is validated like the single-create form."""
+    raw = (await request.body()).decode("utf-8-sig", errors="replace")
+    reader = csv.DictReader(io.StringIO(raw))
+    if not reader.fieldnames:
+        raise HTTPException(422, detail={"code": "EMPTY_CSV", "message": "The CSV has no header row"})
+    required = {"email", "displayName", "password", "role"}
+    missing = required - {f.strip() for f in reader.fieldnames}
+    if missing:
+        raise HTTPException(422, detail={"code": "MISSING_COLUMNS", "message": f"The CSV is missing: {', '.join(sorted(missing))}"})
+
+    ids = managed_facility_ids(db, user)
+    created, rejected = [], []
+    for index, row in enumerate(reader, start=2):
+        if index > 501:
+            break
+        clean = {str(k).strip(): (v.strip() if isinstance(v, str) else v) for k, v in row.items() if k}
+        if not any(clean.values()):
+            continue
+        try:
+            body = StaffCreate(
+                email=clean.get("email") or "",
+                displayName=clean.get("displayName") or "",
+                password=clean.get("password") or "",
+                role=(clean.get("role") or "").upper(),
+                facilityId=clean.get("facilityId") or None,
+                specialty=clean.get("specialty") or None,
+                authorisedToClose=(clean.get("authorisedToClose") or "").lower() in ("1", "true", "yes", "y"),
+            )
+        except ValidationError as exc:
+            rejected.append({"row": index, "email": clean.get("email"), "message": exc.errors()[0].get("msg", "Invalid row")})
+            continue
+        fid = body.facilityId or user.facility_id
+        if not fid or not db.get(Facility, fid) or (ids is not None and fid not in ids):
+            rejected.append({"row": index, "email": body.email, "message": "Facility not found"})
+            continue
+        if db.query(User.id).filter(User.email == body.email).first():
+            rejected.append({"row": index, "email": body.email, "message": "A user with this email already exists"})
+            continue
+        try:
+            with db.begin_nested():
+                u = User(email=body.email, display_name=body.displayName, password_hash=hash_password(body.password), role=Role(body.role), facility_id=fid,
+                         specialty=normalize_specialty(body.specialty), authorised_to_close=body.authorisedToClose)
+                db.add(u); db.flush()
+                record_event(db, user, case_id=None, event_type="STAFF_CREATED", description=f"Staff profile created from CSV: {u.display_name}", new_values=staff_out(u) | {"source": "CSV_IMPORT"})
+            created.append(staff_out(u))
+        except Exception:
+            rejected.append({"row": index, "email": body.email, "message": "Could not create this profile"})
+    db.commit()
+    return {"success": True, "data": {"created": created, "rejected": rejected,
+                                       "counts": {"created": len(created), "rejected": len(rejected)}}, "meta": {}}
 
 @router.patch("/staff/{user_id}")
 def patch_staff(user_id: str, body: StaffPatch, db: Session = Depends(get_db), user=Depends(ADMIN)):

@@ -106,8 +106,16 @@ def detail(db, case: Case) -> dict:
         "routing": routing.summary(db, case),
         "referral": {"id": referral.id, "status": referral.status, "receivingFacilityId": referral.receiving_facility_id,
                      "receivingClinicianId": referral.receiving_clinician_id} if referral else None,
-        "closure": {"id": closure.id, "status": closure.status, "closureType": closure.closure_type, "reason": closure.reason, "closedById": closure.closed_by_id,
-                    "secondSignOffById": closure.second_signoff_by_id, "closedAt": closure.closed_at} if closure else None,
+        "closure": {
+            "id": closure.id,
+            "status": closure.status,
+            "closureType": closure.closure_type,
+            "reason": closure.reason,
+            "closedById": closure.closed_by_id,
+            "secondApproverId": closure.second_approver_id,
+            "secondSignOffById": closure.second_signoff_by_id,
+            "closedAt": closure.closed_at
+        } if closure else None,
         "counts": {"appointments": db.query(Appointment).filter(Appointment.case_id == case.id).count(),
                    "results": db.query(Result).filter(Result.case_id == case.id).count(),
                    "consultations": db.query(Consultation).filter(Consultation.case_id == case.id).count(),
