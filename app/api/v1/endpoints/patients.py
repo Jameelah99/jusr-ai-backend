@@ -1,11 +1,16 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
+from uuid import uuid4
+from app.core import clock
 from app.core.database import get_db
 from app.core.permissions import GLOBAL_ROLES, CREATE_ROLES, visible_cases
 from app.api.v1.deps import clinical_user
-from app.models.entities import Case, Patient, Role, User, Facility, Screening
-from app.schemas.patients import PatientCreate
+from app.models.entities import Case, Patient, Priority, Role, User, Facility, Screening
+from app.schemas.patients import PatientCreate, SimulationCaseCreate
+from app.services import settings_store
+from app.services.ai_rules import generate_for_result_case
+from app.services.workflow import create_case_record
 
 router = APIRouter()
 
@@ -19,7 +24,8 @@ def visible_patients(q, user):
     return q.filter(or_(Patient.facility_id == user.facility_id, Patient.id.in_(on_visible_case)))
 
 def _out(p):
-    return {"id": p.id, "displayLabel": p.display_label, "ageYears": p.age_years, "sex": p.sex, "isSynthetic": p.is_synthetic}
+    return {"id": p.id, "displayLabel": p.display_label, "ageYears": p.age_years, "sex": p.sex,
+            "phone": p.phone, "recordNumber": p.record_number, "isSynthetic": p.is_synthetic}
 
 
 @router.get("")
@@ -102,9 +108,67 @@ def list_patients(
 def create_patient(payload: PatientCreate, db: Session = Depends(get_db), user=Depends(clinical_user)):
     if user.role not in CREATE_ROLES:
         raise HTTPException(403, "Insufficient permissions")
-    patient = Patient(display_label=payload.displayLabel, age_years=payload.ageYears, birth_year=payload.birthYear, sex=payload.sex, is_synthetic=True, data_origin="SYNTHETIC", facility_id=user.facility_id)
+    patient = Patient(display_label=payload.displayLabel, age_years=payload.ageYears, birth_year=payload.birthYear, sex=payload.sex,
+                      phone=payload.phone, record_number=payload.recordNumber, is_synthetic=True, data_origin="SYNTHETIC",
+                      facility_id=user.facility_id,
+                      preferred_language=payload.preferredLanguage or "en")
     db.add(patient); db.commit(); db.refresh(patient)
-    return {"success": True, "data": {"id": patient.id, "displayLabel": patient.display_label, "isSynthetic": True}, "meta": {}}
+    return {"success": True, "data": _out(patient), "meta": {}}
+
+
+@router.post("/simulation-case")
+def create_simulation_case(payload: SimulationCaseCreate, db: Session = Depends(get_db), user=Depends(clinical_user)):
+    """Coordinator onboarding: register a patient and open an actionable simulated case."""
+    if user.role not in (Role.COORDINATOR, Role.NATIONAL_ADMIN):
+        raise HTTPException(403, "Only a coordinator can onboard a simulated case")
+    facility_id = payload.facilityId or user.facility_id
+    facility = db.get(Facility, facility_id) if facility_id else None
+    if not facility:
+        raise HTTPException(422, detail={"code": "FACILITY_REQUIRED", "message": "Choose a facility for the patient"})
+    now = clock.now()
+    patient = Patient(display_label=payload.displayLabel, age_years=payload.ageYears, birth_year=payload.birthYear,
+                      sex=payload.sex, phone=payload.phone, record_number=payload.recordNumber,
+                      is_synthetic=True, data_origin="SYNTHETIC", facility_id=facility.id,
+                      preferred_language=payload.preferredLanguage)
+    db.add(patient)
+    db.flush()
+    case = create_case_record(
+        db,
+        user,
+        patient=patient,
+        case_number=f"C-{uuid4().hex[:8].upper()}",
+        facility_id=facility.id,
+        priority=Priority(payload.priority),
+        next_action_code="REVIEW_RESULT",
+        next_action_label=payload.nextActionLabel or "Review the screening result with the patient",
+        required_specialty=payload.requiredSpecialty,
+        confirmatory_required=bool(payload.confirmatoryRequired) if payload.confirmatoryRequired is not None else "abnormal" in payload.outcome.lower() or "positive" in payload.outcome.lower(),
+        match_confidence=1.0,
+        at=now,
+    )
+    screening = Screening(patient_id=patient.id, screening_type=payload.screeningType, outcome=payload.outcome,
+                          display_label=f"{payload.screeningType}: {payload.outcome}")
+    db.add(screening)
+    db.flush()
+    case.screening_id = screening.id
+    case.due_at = settings_store.due_for(db, case.status, now, facility_id=facility.id)
+    db.flush()
+    generate_for_result_case(db, case)
+    db.commit()
+    db.refresh(case)
+    return {
+        "success": True,
+        "data": {
+            "patientId": patient.id,
+            "caseId": case.case_number,
+            "caseNumber": case.case_number,
+            "trackerId": case.tracker_id,
+            "status": case.status.value,
+            "priority": case.priority.value,
+            "facilityId": facility.id,
+        },
+        "meta": {},
+    }
 
 @router.get("/{patient_id}")
 def get_patient(patient_id: str, db: Session = Depends(get_db), user=Depends(clinical_user)):

@@ -88,6 +88,27 @@ def generate_link(
     )
     db.add(link)
     db.flush()
+    url = f"{settings.patient_link_base_url.rstrip('/')}/p/{token}"
+    sms = None
+    if patient.phone:
+        # Demo only: no SMS gateway is connected. The send and its outcome are
+        # recorded so the case shows who received the link and when.
+        link.delivery_channel = "SMS"
+        link.delivery_status = "DELIVERED"
+        link.delivered_to = patient.phone
+        link.delivered_at = now
+        sms = {
+            "to": patient.phone,
+            "status": "DELIVERED",
+            "channel": "SMS",
+            "simulated": True,
+            "sentAt": now,
+            "body": (
+                f"Jusr AI: your secure result link is {url} "
+                f"(expires in {settings.patient_link_expiry_days} day(s)). "
+                "This is a simulated message for demonstration only."
+            ),
+        }
     record_event(
         db,
         user,
@@ -98,6 +119,9 @@ def generate_link(
             "linkId": link.id,
             "expiresAt": link.expires_at.isoformat(),
             "supersededLinkIds": [o.id for o in previous],
+            "smsTo": patient.phone,
+            "smsStatus": link.delivery_status,
+            "smsSimulated": bool(sms),
         },
     )
     db.commit()
@@ -106,10 +130,11 @@ def generate_link(
         "data": {
             "linkId": link.id,
             "token": token,
-            "url": f"{settings.patient_link_base_url.rstrip('/')}/p/{token}",
+            "url": url,
             "expiresAt": link.expires_at,
             "verificationRequired": needs_verification(patient),
             "resent": bool(previous),
+            "sms": sms,
             "note": "The token is shown once and cannot be retrieved again.",
         },
         "meta": {},
@@ -140,6 +165,10 @@ def list_links(
                 "verifiedAt": l.verified_at,
                 "lastAccessedAt": l.last_accessed_at,
                 "createdById": l.created_by_id,
+                "deliveryChannel": l.delivery_channel,
+                "deliveryStatus": l.delivery_status,
+                "deliveredTo": l.delivered_to,
+                "deliveredAt": l.delivered_at,
             }
             for l in rows
         ],

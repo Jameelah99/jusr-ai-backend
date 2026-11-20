@@ -62,6 +62,30 @@ def add_facility(body: FacilityCreate, db: Session = Depends(get_db), user=Depen
     db.commit()
     return {"success": True, "data": facility_out(f), "meta": {}}
 
+class FacilityPatch(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    type: str | None = Field(default=None, max_length=60)
+    timeZone: str | None = Field(default=None, max_length=60)
+    workingDays: list[Literal["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]] | None = None
+    connectorType: Literal["FEED_SIMULATOR", "CSV"] | None = None
+
+@router.patch("/facilities/{facility_id}")
+def patch_facility(facility_id: str, body: FacilityPatch, db: Session = Depends(get_db), user=Depends(ADMIN)):
+    f = db.get(Facility, facility_id)
+    ids = managed_facility_ids(db, user)
+    if not f or (ids is not None and f.id not in ids):
+        raise HTTPException(404, "Facility not found")
+    old = facility_out(f)
+    if body.name is not None: f.name = body.name
+    if "type" in body.model_fields_set: f.facility_type = body.type
+    if body.timeZone is not None: f.time_zone = body.timeZone
+    if "workingDays" in body.model_fields_set: f.working_days = body.workingDays
+    if body.connectorType is not None: f.connector_type = body.connectorType
+    auditable = lambda d: d | {"lastEventAt": d["lastEventAt"].isoformat() if d["lastEventAt"] else None}
+    record_event(db, user, case_id=None, event_type="FACILITY_UPDATED", description=f"Facility updated: {f.name}", old_values=auditable(old), new_values=auditable(facility_out(f)))
+    db.commit()
+    return {"success": True, "data": facility_out(f), "meta": {}}
+
 # ---------------------------------------------------------------- staff profiles
 
 @router.get("/staff")
@@ -119,8 +143,10 @@ class StaffCreate(BaseModel):
     authorisedToClose: bool = False
 
 class StaffPatch(BaseModel):
+    email: str | None = Field(default=None, pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$", max_length=255)
     displayName: str | None = Field(default=None, min_length=1, max_length=160)
     role: Literal["COORDINATOR", "REFERRING_CLINICIAN", "RECEIVING_CLINICIAN", "FACILITY_ADMIN"] | None = None
+    facilityId: str | None = None
     specialty: str | None = Field(default=None, max_length=60)
     authorisedToClose: bool | None = None
     isActive: bool | None = None
@@ -205,8 +231,17 @@ async def import_staff_csv(request: Request, db: Session = Depends(get_db), user
 def patch_staff(user_id: str, body: StaffPatch, db: Session = Depends(get_db), user=Depends(ADMIN)):
     u = _managed_user(db, user, user_id)
     old = staff_out(u)
+    if body.email is not None and body.email != u.email:
+        if db.query(User.id).filter(User.email == body.email, User.id != u.id).first():
+            raise HTTPException(409, detail={"code": "EMAIL_IN_USE", "message": "A user with this email already exists"})
+        u.email = body.email
     if body.displayName is not None: u.display_name = body.displayName
     if body.role is not None: u.role = Role(body.role)
+    if body.facilityId is not None and body.facilityId != u.facility_id:
+        ids = managed_facility_ids(db, user)
+        if not db.get(Facility, body.facilityId) or (ids is not None and body.facilityId not in ids):
+            raise HTTPException(404, "Facility not found")
+        u.facility_id = body.facilityId
     if "specialty" in body.model_fields_set: u.specialty = normalize_specialty(body.specialty)
     if body.authorisedToClose is not None: u.authorised_to_close = body.authorisedToClose
     if body.isActive is not None: u.is_active = body.isActive

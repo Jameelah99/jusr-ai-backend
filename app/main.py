@@ -27,6 +27,8 @@ app.add_middleware(
 )
 register_error_handlers(app)
 app.include_router(patient_portal.router, prefix="/p", tags=["Patient Secure Link"])
+# The patient portal frontend calls /api/p/...; serve the same secure-link routes there.
+app.include_router(patient_portal.router, prefix="/api/p", include_in_schema=False)
 app.include_router(api_router, prefix="/api/v1")
 # The frontend register uses unversioned /api/... paths; serve the same routes there.
 app.include_router(api_router, prefix="/api", include_in_schema=False)

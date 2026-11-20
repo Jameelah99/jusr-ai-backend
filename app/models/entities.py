@@ -190,6 +190,7 @@ class Patient(Base):
     facility_id: Mapped[str | None] = mapped_column(ForeignKey("facilities.id"), nullable=True)
     birth_year: Mapped[int | None] = mapped_column(Integer, nullable=True)  # used only to verify patient secure links; never returned by staff APIs
     record_number: Mapped[str | None] = mapped_column(String(60), nullable=True, index=True)  # facility record number, a patient-match identifier
+    phone: Mapped[str | None] = mapped_column(String(40), nullable=True)  # SMS contact for the secure patient link (synthetic demo data)
     preferred_language: Mapped[str] = mapped_column(String(10), default="en", server_default="en")
 
 class Screening(Base):
@@ -323,6 +324,11 @@ class PatientLink(Base):
     locked_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
     verified_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
     last_accessed_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
+    # Simulated SMS delivery of the link (demo only; no SMS gateway is connected)
+    delivery_channel: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    delivery_status: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    delivered_to: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    delivered_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
 
 class PatientResponse(Base):
     """A response about a case: submitted by the patient via link, or recorded by staff on their behalf."""

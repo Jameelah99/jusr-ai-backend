@@ -39,6 +39,7 @@ from app.schemas.ai import (
     SuggestionCreate,
     SuggestionReject,
 )
+from app.services import ai_rules
 from app.services.audit import record_event, reject_and_log
 from app.services.workflow import create_case_record, create_referral_record
 from app.schemas.ai import (
@@ -475,6 +476,56 @@ def read_document(
             "simulated": True,
         },
         "meta": {},
+    }
+
+
+# ---------- rules-based generation (demo staff action) ----------
+
+
+@router.post("/generate")
+def generate_suggestions(
+    payload: dict | None = None,
+    db: Session = Depends(get_db),
+    user=Depends(clinical_user),
+):
+    """Generate pending suggestions for one case or for the visible open cases.
+
+    Deterministic rules only; every result still needs approval from the role
+    named in the approver matrix.
+    """
+    body = payload or {}
+    kinds = body.get("kinds")
+    if kinds is not None:
+        if not isinstance(kinds, list):
+            raise HTTPException(422, "kinds must be a list")
+        kinds = [str(k).upper() for k in kinds]
+        if not set(kinds) <= {k.value for k in AiKind}:
+            raise HTTPException(422, "Unknown suggestion kind")
+
+    raw_case = body.get("caseId")
+    if raw_case:
+        case = (
+            db.query(Case)
+            .filter((Case.id == raw_case) | (Case.case_number == raw_case))
+            .first()
+        )
+        if not case or not can_view_case(user, case, db):
+            raise HTTPException(404, "Case not found")
+        cases = [case]
+    else:
+        q = db.query(Case).filter(Case.status != CaseStatus.CLOSED)
+        if user.role not in GLOBAL_ROLES:
+            q = q.filter(Case.id.in_(visible_cases(select(Case.id), user)))
+        cases = q.order_by(Case.updated_at.desc()).limit(25).all()
+
+    created: list[AiSuggestion] = []
+    for case in cases:
+        created.extend(ai_rules.generate_for_case(db, case, kinds))
+    db.commit()
+    return {
+        "success": True,
+        "data": [out(s) for s in created],
+        "meta": {"cases": len(cases), "created": len(created)},
     }
 
 

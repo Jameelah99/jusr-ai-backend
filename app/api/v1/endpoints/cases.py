@@ -94,6 +94,8 @@ def detail(db, case: Case) -> dict:
     facility = db.get(Facility, case.facility_id)
     referral = db.query(Referral).filter(Referral.case_id == case.id).order_by(Referral.created_at.desc()).first()
     closure = db.query(Closure).filter(Closure.case_id == case.id).order_by(Closure.requested_at.desc()).first()
+    closed_by = db.get(User, closure.closed_by_id) if closure and closure.closed_by_id else None
+    second_approver = db.get(User, closure.second_approver_id) if closure and closure.second_approver_id else None
     data.update({
         "patient": {"id": patient.id, "displayLabel": patient.display_label, "ageYears": patient.age_years, "sex": patient.sex, "preferredLanguage": patient.preferred_language},
         "screening": {"id": screening.id, "type": screening.screening_type, "outcome": screening.outcome, "displayLabel": screening.display_label} if screening else None,
@@ -112,7 +114,10 @@ def detail(db, case: Case) -> dict:
             "closureType": closure.closure_type,
             "reason": closure.reason,
             "closedById": closure.closed_by_id,
+            "closedByName": closed_by.display_name if closed_by else None,
             "secondApproverId": closure.second_approver_id,
+            "secondApproverName": second_approver.display_name if second_approver else None,
+            "requestedAt": closure.requested_at,
             "secondSignOffById": closure.second_signoff_by_id,
             "closedAt": closure.closed_at
         } if closure else None,

@@ -107,9 +107,14 @@ def get_referral(referral_id: str, db: Session = Depends(get_db), user=Depends(c
 def create_referral(payload: ReferralCreate, db: Session = Depends(get_db), user=Depends(clinical_user)):
     case = db.query(Case).filter((Case.id == payload.caseId) | (Case.case_number == payload.caseId)).first()
     if not case or not can_view_case(user, case, db): raise HTTPException(404, "Case not found")
-    if not _referrer_side(user, case): _forbid()
-    if user.role not in (Role.REFERRING_CLINICIAN, Role.NATIONAL_ADMIN):
-        reject_and_log(db, user, case_id=case.id, attempted="referral:create", status_code=403, code="ROLE_NOT_ALLOWED", message="Only a referring clinician can send a referral")
+    # A receiving clinician may forward a case they already see (e.g. after a decline);
+    # referring clinicians and national admins follow the normal ownership rules.
+    if user.role == Role.RECEIVING_CLINICIAN:
+        if not can_view_case(user, case, db): _forbid()
+    elif not _referrer_side(user, case):
+        _forbid()
+    if user.role not in (Role.REFERRING_CLINICIAN, Role.RECEIVING_CLINICIAN, Role.NATIONAL_ADMIN):
+        reject_and_log(db, user, case_id=case.id, attempted="referral:create", status_code=403, code="ROLE_NOT_ALLOWED", message="Only a clinician can send a referral")
     r = create_referral_record(db, user, case, facility_id=payload.receivingFacilityId, clinician_id=payload.receivingClinicianId, reason=payload.reason,
                                target_specialty=payload.targetSpecialty, packet=payload.packet)
     return _done(db, r)

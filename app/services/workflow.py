@@ -58,8 +58,8 @@ def create_referral_record(db, user, case, *, facility_id, clinician_id=None, re
         sm.apply(db, user, case, "T10", ctx={"referral": r}, details=details, at=now, owner=user.id)
     elif case.status == CaseStatus.REFERRAL_PENDING:
         # A new referral after a decline or a missed deadline: the status stays REFERRAL_PENDING (T13 follow-up).
-        if user.role not in (Role.REFERRING_CLINICIAN, Role.NATIONAL_ADMIN):
-            reject_and_log(db, user, case_id=case.id, attempted="referral:create", status_code=403, code="ROLE_NOT_ALLOWED", message="Only a referring clinician can send a referral")
+        if user.role not in (Role.REFERRING_CLINICIAN, Role.RECEIVING_CLINICIAN, Role.NATIONAL_ADMIN):
+            reject_and_log(db, user, case_id=case.id, attempted="referral:create", status_code=403, code="ROLE_NOT_ALLOWED", message="Only a clinician can send a referral")
         case.coordinator_id = user.id; case.due_at = None
         from app.services import settings_store
         case.status_entered_at = now; case.due_at = settings_store.due_for(db, CaseStatus.REFERRAL_PENDING, now, facility_id=case.facility_id)

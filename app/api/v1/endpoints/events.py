@@ -16,6 +16,7 @@ from app.core.permissions import GLOBAL_ROLES, visible_cases
 from app.models.entities import (Appointment, Attendance, AuditEvent, Case, CaseStatus, DelayReason, Facility, InboundEvent, Patient, Priority, Result, Role,
                                  RoutingRule, Screening, User)
 from app.services import state_machine as sm
+from app.services.ai_rules import generate_for_result_case
 from app.services.audit import record_event
 from app.services.tasks import create_task
 from app.services.workflow import create_case_record
@@ -82,7 +83,9 @@ def _case_in_facility(db, payload, facility_id) -> Case:
     return case
 
 def _test(payload):
-    t = payload.get("test") or {}
+    t = payload.get("test") or {"code": payload.get("testCode"), "name": payload.get("testName"), "value": payload.get("testValue")}
+    if "abnormal" not in t and "abnormal" in payload:
+        t["abnormal"] = payload["abnormal"]
     if not (t.get("code") and str(t.get("value", "")).strip()):
         raise Invalid("UNREADABLE_RESULT", "The result has no test code or value")
     return t
@@ -99,8 +102,8 @@ def _first_coordinator(db, facility_id):
 
 def h_result(db, actor, facility, body, now):
     p = body.payload
+    ident = p.get("patient") or {k: p[k] for k in ("patientId", "name", "birthYear", "recordNumber") if k in p}
     test = _test(p)
-    ident = p.get("patient") or {}
     patient, conf, candidates = match_patient(db, facility.id, ident)
     stype = (p.get("screeningType") or "").strip() or "Unspecified screening"
     outcome = (p.get("outcome") or "Abnormal").strip()
@@ -117,6 +120,8 @@ def h_result(db, actor, facility, body, now):
                   abnormal=bool(test.get("abnormal", True)), issued_at=_parse_dt(p.get("issuedAt")), source="FEED", event_id=body.eventId, received_at=now))
     if conf < 1.0:
         create_task(db, case, "CONFIRM_PATIENT_MATCH", "Confirm the patient match", "Candidates: " + ", ".join(c.display_label for c in candidates), source_ref=body.eventId)
+    db.flush()
+    generate_for_result_case(db, case)
     return case
 
 def h_confirmatory(db, actor, facility, body, now):
@@ -265,14 +270,19 @@ def ingest(db, actor, body: InboundBody, *, raise_on_error=True) -> dict:
         d = e.detail if isinstance(e.detail, dict) else {"message": str(e.detail)}
         return {"status": "REJECTED", "eventId": body.eventId, "code": d.get("code", "REFUSED"), "message": d.get("message")}
 
-def _may_ingest(user, body):
-    if user.role == Role.FACILITY_ADMIN and body.type == "TEST_EVENT" and user.facility_id == body.facilityId:
+def _admin_manages(db, user, facility_id) -> bool:
+    """A facility administrator manages their own facility and any facility they added (OpenMRS onboarding handshake)."""
+    f = db.get(Facility, facility_id) if facility_id else None
+    return bool(f and (f.id == user.facility_id or f.created_by_id == user.id))
+
+def _may_ingest(db, user, body):
+    if user.role == Role.FACILITY_ADMIN and body.type == "TEST_EVENT" and _admin_manages(db, user, body.facilityId):
         return True
     return user.role in (Role.COORDINATOR, Role.NATIONAL_ADMIN)
 
 @router.post("")
 def post_event(body: InboundBody, db: Session = Depends(get_db), user=Depends(require_roles("COORDINATOR", "NATIONAL_ADMIN", "FACILITY_ADMIN"))):
-    if not _may_ingest(user, body): raise HTTPException(403, "Insufficient permissions")
+    if not _may_ingest(db, user, body): raise HTTPException(403, "Insufficient permissions")
     return {"success": True, "data": ingest(db, user, body), "meta": {}}
 
 @router.post("/batch")
@@ -282,12 +292,31 @@ def post_events(body: BatchBody, db: Session = Depends(get_db), user=Depends(req
     counts = {s: sum(1 for o in out if o["status"] == s) for s in ("ACCEPTED", "DUPLICATE", "REJECTED")}
     return {"success": True, "data": {"results": out, "counts": counts}, "meta": {}}
 
-CSV_FIELDS = ("patientId", "caseId", "testCode", "testName", "testValue", "abnormal", "issuedAt", "screeningType", "outcome",
+CSV_FIELDS = ("patientId", "name", "birthYear", "recordNumber", "caseId", "testCode", "testName", "testValue", "abnormal", "issuedAt", "screeningType", "outcome",
               "confirmatoryRequired", "scheduledAt", "attendance", "reasonCode", "note", "startDate", "kind", "attachmentRef", "newFacilityId")
 
 
+@router.get("/csv/template")
+def events_csv_template(db: Session = Depends(get_db), user=Depends(require_roles("COORDINATOR", "NATIONAL_ADMIN"))):
+    """A ready-to-upload example row that uses real facility/patient ids from this workspace."""
+    patient = db.query(Patient).filter(Patient.facility_id.isnot(None)).order_by(Patient.display_label).first()
+    if not patient:
+        raise HTTPException(422, detail={"code": "NO_PATIENT", "message": "Register a patient before downloading a template"})
+    facility = db.get(Facility, patient.facility_id)
+    if not facility:
+        raise HTTPException(422, detail={"code": "NO_FACILITY", "message": "Add a facility before downloading a template"})
+    from datetime import timezone
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["eventId", "type", "facilityId", "patientId", "testCode", "testName", "testValue", "abnormal",
+                     "screeningType", "outcome", "confirmatoryRequired", "issuedAt"])
+    writer.writerow([f"EMR-{uuid4().hex[:10].upper()}", "RESULT_RECEIVED", facility.id, patient.id, "VIA", "Visual inspection with acetic acid",
+                     "Positive", "true", "Cervical screening", "Abnormal", "true", datetime.now(timezone.utc).isoformat()])
+    return {"success": True, "data": {"csv": buf.getvalue(), "facility": facility.name, "patient": patient.display_label}, "meta": {}}
+
+
 @router.post("/csv")
-async def post_events_csv(request: Request, db: Session = Depends(get_db), user=Depends(require_roles("COORDINATOR", "NATIONAL_ADMIN"))):
+async def post_events_csv(request: Request, db: Session = Depends(get_db), user=Depends(require_roles("COORDINATOR", "NATIONAL_ADMIN", "FACILITY_ADMIN"))):
     """R-24/R-25: import a CSV file of inbound events. Every row goes through the same validation as the API,
     so an unreadable row is refused and listed without stopping the rest. Columns: eventId, type, facilityId,
     occurredAt (optional) and payload (optional JSON). Common event fields may also be their own columns."""
@@ -330,6 +359,14 @@ async def post_events_csv(request: Request, db: Session = Depends(get_db), user=
         except Exception as exc:  # pydantic validation: an unknown type or malformed date
             results.append({"row": index, "status": "REJECTED", "code": "INVALID_ROW", "message": str(exc).splitlines()[0][:300]})
             continue
+        if user.role == Role.FACILITY_ADMIN:
+            if not _admin_manages(db, user, body.facilityId):
+                results.append({"row": index, "status": "REJECTED", "code": "FACILITY_NOT_ALLOWED", "message": "You can upload events only for facilities you manage"})
+                continue
+            facility = db.get(Facility, body.facilityId)
+            if not facility or facility.connector_type != "CSV":
+                results.append({"row": index, "status": "REJECTED", "code": "CONNECTOR_NOT_CSV", "message": "This facility is not set up for CSV upload"})
+                continue
         outcome = ingest(db, user, body, raise_on_error=False)
         results.append({"row": index, **outcome})
 
