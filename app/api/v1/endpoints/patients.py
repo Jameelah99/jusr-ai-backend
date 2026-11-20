@@ -6,13 +6,24 @@ from app.core import clock
 from app.core.database import get_db
 from app.core.permissions import GLOBAL_ROLES, CREATE_ROLES, visible_cases
 from app.api.v1.deps import clinical_user
-from app.models.entities import Case, Patient, Priority, Role, User, Facility, Screening
+from app.models.entities import Case, CaseStatus, Patient, Priority, Role, User, Facility, Screening
 from app.schemas.patients import PatientCreate, SimulationCaseCreate
 from app.services import settings_store
 from app.services.ai_rules import generate_for_result_case
+from app.services.audit import record_event
 from app.services.workflow import create_case_record
 
 router = APIRouter()
+
+SIMULATED_STAGE_NEXT_ACTION = {
+    "NOTIFYING": ("NOTIFY_PATIENT", "Notify the patient of the result"),
+    "AWAITING_ACK": ("PATIENT_ACK", "Await the patient's acknowledgement"),
+    "AWAITING_CONFIRMATION": ("CONFIRMATORY_TEST", "Arrange the confirmatory test"),
+    "REFERRAL_PENDING": ("REFERRAL_ACCEPT", "Await the receiving clinic's acceptance"),
+    "AWAITING_APPOINTMENT": ("APPOINTMENT", "Track the booked appointment"),
+    "AWAITING_TREATMENT": ("TREATMENT_FOLLOW_UP", "Monitor treatment or follow-up"),
+    "READY_TO_CLOSE": ("CLOSE_CASE", "Close the case once care is confirmed"),
+}
 
 def visible_patients(q, user):
     """Patients from the user's own facility, or on a case the user can see."""
@@ -152,6 +163,21 @@ def create_simulation_case(payload: SimulationCaseCreate, db: Session = Depends(
     db.flush()
     case.screening_id = screening.id
     case.due_at = settings_store.due_for(db, case.status, now, facility_id=facility.id)
+    if payload.initialStatus and payload.initialStatus != case.status.value:
+        # Demo seeding: start the synthetic case at a later care stage so staff
+        # can preview the patient page at that stage. Real cases still move only
+        # through the guarded state machine; this bypass is simulation-only and
+        # is recorded as a simulated stage, never as a clinical transition.
+        old_status = case.status
+        case.status = CaseStatus(payload.initialStatus)
+        case.status_entered_at = now
+        case.due_at = settings_store.due_for(db, case.status, now, facility_id=facility.id)
+        case.next_action_code, case.next_action_label = SIMULATED_STAGE_NEXT_ACTION.get(
+            payload.initialStatus, (case.next_action_code, case.next_action_label)
+        )
+        record_event(db, user, case_id=case.id, event_type="SIMULATED_STAGE_SET",
+                     description=f"Simulated case started at stage {case.status.value}",
+                     old_values={"status": old_status.value}, new_values={"status": case.status.value, "simulated": True})
     db.flush()
     generate_for_result_case(db, case)
     db.commit()

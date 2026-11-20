@@ -46,7 +46,10 @@ def context(db: Session, token: str, session: str | None, *, require_session: bo
     """Resolve link, case and patient; enforce birth-year verification when it applies."""
     link = load_link(db, token)
     case = db.get(Case, link.case_id); patient = db.get(Patient, link.patient_id)
-    if require_session and needs_verification(patient) and patient_session_link_id(session) != link.id:
+    # A staff preview link already requires a staff session to create; the
+    # birth-year check exists for links that travel to the patient.
+    preview = link.delivery_channel == "PREVIEW"
+    if require_session and not preview and needs_verification(patient) and patient_session_link_id(session) != link.id:
         _gone(403, "VERIFICATION_REQUIRED", "Please verify your birth year to continue", verificationRequired=True, attemptsRemaining=attempts_remaining(link))
     return link, case, patient
 

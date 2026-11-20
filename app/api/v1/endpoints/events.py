@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from app.core import clock
 from app.core.database import get_db
 from app.api.v1.deps import clinical_user, require_roles
+from app.api.v1.endpoints.admin import managed_facility_ids
 from app.api.v1.endpoints.case_actions import record_attendance, record_treatment_start
 from app.api.v1.endpoints.cases import find_case
 from app.core.permissions import GLOBAL_ROLES, visible_cases
@@ -380,11 +381,15 @@ def rejected_items(facilityId: str | None = None, page: int = Query(1, ge=1), pa
                    user=Depends(require_roles("COORDINATOR", "NATIONAL_ADMIN", "FACILITY_ADMIN"))):
     """Coordinators see the rejected items. The facility administrator sees counts only, no clinical content (R-09)."""
     q = db.query(InboundEvent).filter(InboundEvent.status == "REJECTED")
-    fid = facilityId if user.role == Role.NATIONAL_ADMIN else user.facility_id
-    if fid: q = q.filter(InboundEvent.facility_id == fid)
     if user.role == Role.FACILITY_ADMIN:
+        # Every facility the administrator manages, not just their own, so the
+        # feed reflects errors from every connector they added.
+        managed = managed_facility_ids(db, user) or set()
+        q = q.filter(InboundEvent.facility_id.in_(managed))
         rows = q.with_entities(InboundEvent.error_code, func.count(InboundEvent.id)).group_by(InboundEvent.error_code).all()
         return {"success": True, "data": {"total": sum(n for _, n in rows), "byErrorCode": {c: n for c, n in rows}}, "meta": {}}
+    fid = facilityId if user.role == Role.NATIONAL_ADMIN else user.facility_id
+    if fid: q = q.filter(InboundEvent.facility_id == fid)
     total = q.count()
     rows = q.order_by(InboundEvent.received_at.desc(), InboundEvent.id).offset((page - 1) * pageSize).limit(pageSize).all()
     return {"success": True, "data": [{"id": r.id, "eventId": r.event_id, "type": r.type, "facilityId": r.facility_id, "errorCode": r.error_code, "message": r.error_message,

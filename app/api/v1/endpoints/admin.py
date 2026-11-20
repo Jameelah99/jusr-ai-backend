@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.core.security import hash_password
 from app.api.v1.deps import current_user, require_roles
-from app.models.entities import Facility, Role, User
+from app.models.entities import Case, Facility, InboundEvent, Patient, Role, User
 from app.services.audit import record_event
 from app.services.routing import normalize_specialty
 
@@ -85,6 +85,28 @@ def patch_facility(facility_id: str, body: FacilityPatch, db: Session = Depends(
     record_event(db, user, case_id=None, event_type="FACILITY_UPDATED", description=f"Facility updated: {f.name}", old_values=auditable(old), new_values=auditable(facility_out(f)))
     db.commit()
     return {"success": True, "data": facility_out(f), "meta": {}}
+
+@router.delete("/facilities/{facility_id}")
+def delete_facility(facility_id: str, db: Session = Depends(get_db), user=Depends(ADMIN)):
+    """Remove a facility the administrator added. History keeps it from being deleted while in use."""
+    f = db.get(Facility, facility_id)
+    ids = managed_facility_ids(db, user)
+    if not f or (ids is not None and f.id not in ids):
+        raise HTTPException(404, "Facility not found")
+    in_use = (
+        db.query(Case.id).filter(Case.facility_id == f.id).first()
+        or db.query(Patient.id).filter(Patient.facility_id == f.id).first()
+        or db.query(User.id).filter(User.facility_id == f.id).first()
+    )
+    if in_use:
+        raise HTTPException(409, detail={"code": "FACILITY_IN_USE",
+                                         "message": "This facility still has patients, staff or cases. Move or remove them first."})
+    db.query(InboundEvent).filter(InboundEvent.facility_id == f.id).delete()
+    old = facility_out(f) | {"lastEventAt": f.last_event_at.isoformat() if f.last_event_at else None}
+    record_event(db, user, case_id=None, event_type="FACILITY_DELETED", description=f"Facility removed: {f.name}", old_values=old)
+    db.delete(f)
+    db.commit()
+    return {"success": True, "data": {"id": facility_id, "removed": True}, "meta": {}}
 
 # ---------------------------------------------------------------- staff profiles
 
@@ -248,3 +270,18 @@ def patch_staff(user_id: str, body: StaffPatch, db: Session = Depends(get_db), u
     record_event(db, user, case_id=None, event_type="STAFF_UPDATED", description=f"Staff profile updated: {u.display_name}", old_values=old, new_values=staff_out(u))
     db.commit()
     return {"success": True, "data": staff_out(u), "meta": {}}
+
+@router.delete("/staff/{user_id}")
+def delete_staff(user_id: str, db: Session = Depends(get_db), user=Depends(ADMIN)):
+    """Remove a staff profile from the directory.
+
+    The account is deactivated rather than erased so past cases and the audit
+    trail keep pointing at a real person.
+    """
+    u = _managed_user(db, user, user_id)
+    if u.id == user.id:
+        raise HTTPException(422, detail={"code": "SELF_REMOVAL", "message": "You cannot remove your own account"})
+    u.is_active = False
+    record_event(db, user, case_id=None, event_type="STAFF_REMOVED", description=f"Staff profile removed: {u.display_name}", old_values=staff_out(u))
+    db.commit()
+    return {"success": True, "data": {"id": u.id, "removed": True, "deactivated": True}, "meta": {}}

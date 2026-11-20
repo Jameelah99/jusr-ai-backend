@@ -38,6 +38,104 @@ def _check_scope(db, user, scope: str):
 def _row(r: Setting):
     return {"key": r.key, "scope": r.scope, "value": r.value, "changedById": r.changed_by_id, "changedAt": r.changed_at}
 
+# ---------------------------------------------------------------- named specialty catalog
+# Administrators maintain the list of specialties used by routing and the named
+# backups dropdown. National administrators edit the global list; facility
+# administrators maintain their own facility list, which is merged on read.
+
+CATALOG_KEY = "specialty.catalog"
+
+def _catalog_scope(user) -> str:
+    if user.role == Role.NATIONAL_ADMIN or not user.facility_id:
+        return "global"
+    return f"facility:{user.facility_id}"
+
+def _catalog_row(db, scope):
+    return db.query(Setting).filter(Setting.key == CATALOG_KEY, Setting.scope == scope).first()
+
+def _catalog_entries(db, scope) -> list[dict]:
+    row = _catalog_row(db, scope)
+    entries = row.value if row and isinstance(row.value, list) else []
+    return [
+        {"name": e["name"], "label": e.get("label") or e["name"]}
+        for e in entries
+        if isinstance(e, dict) and e.get("name")
+    ]
+
+def _effective_catalog(db, user) -> list[dict]:
+    merged: dict[str, dict] = {}
+    own = _catalog_scope(user)
+    scopes = ["global"] if own == "global" else ["global", own]
+    for scope in scopes:
+        for entry in _catalog_entries(db, scope):
+            merged[entry["name"]] = {**entry, "scope": scope}
+    return [merged[name] for name in sorted(merged)]
+
+def _save_catalog(db, user, entries: list[dict]):
+    scope = _catalog_scope(user)
+    row = _catalog_row(db, scope)
+    old = row.value if row else None
+    if row:
+        row.value = entries
+        row.changed_by_id = user.id
+        row.changed_at = clock.now()
+    else:
+        db.add(Setting(key=CATALOG_KEY, scope=scope, value=entries, changed_by_id=user.id, changed_at=clock.now()))
+    record_event(db, user, case_id=None, event_type="SPECIALTY_CATALOG_CHANGED", description=f"Specialty list updated ({scope})",
+                 old_values={"specialties": old}, new_values={"specialties": entries})
+    db.commit()
+
+def _catalog_out(entry: dict, user) -> dict:
+    return {**entry, "editable": entry["scope"] == _catalog_scope(user)}
+
+class SpecialtyBody(BaseModel):
+    name: str = Field(min_length=1, max_length=60)
+    label: str | None = Field(default=None, max_length=80)
+
+@router.get("/specialties")
+def list_specialties(db: Session = Depends(get_db), user=Depends(VIEW)):
+    return {"success": True, "data": [_catalog_out(e, user) for e in _effective_catalog(db, user)], "meta": {}}
+
+@router.post("/specialties")
+def add_specialty(body: SpecialtyBody, db: Session = Depends(get_db), user=Depends(EDIT)):
+    name = normalize_specialty(body.name)
+    if not name:
+        raise HTTPException(422, "Give a specialty name")
+    entries = _catalog_entries(db, _catalog_scope(user))
+    if any(e["name"] == name for e in entries) or any(e["name"] == name for e in _effective_catalog(db, user)):
+        raise HTTPException(409, detail={"code": "SPECIALTY_EXISTS", "message": f"{name} is already on the list"})
+    entries.append({"name": name, "label": (body.label or body.name).strip()})
+    _save_catalog(db, user, entries)
+    return {"success": True, "data": _catalog_out({"name": name, "label": (body.label or body.name).strip(), "scope": _catalog_scope(user)}, user), "meta": {}}
+
+@router.put("/specialties/{name}")
+def edit_specialty(name: str, body: SpecialtyBody, db: Session = Depends(get_db), user=Depends(EDIT)):
+    current = normalize_specialty(name)
+    entries = _catalog_entries(db, _catalog_scope(user))
+    index = next((i for i, e in enumerate(entries) if e["name"] == current), None)
+    if index is None:
+        raise HTTPException(403, detail={"code": "GLOBAL_SPECIALTY", "message": "A national administrator manages this specialty"})
+    new_name = normalize_specialty(body.name)
+    if not new_name:
+        raise HTTPException(422, "Give a specialty name")
+    if new_name != current and any(e["name"] == new_name for e in entries):
+        raise HTTPException(409, detail={"code": "SPECIALTY_EXISTS", "message": f"{new_name} is already on the list"})
+    entries[index] = {"name": new_name, "label": (body.label or body.name).strip()}
+    _save_catalog(db, user, entries)
+    return {"success": True, "data": _catalog_out({**entries[index], "scope": _catalog_scope(user)}, user), "meta": {}}
+
+@router.delete("/specialties/{name}")
+def delete_specialty(name: str, db: Session = Depends(get_db), user=Depends(EDIT)):
+    current = normalize_specialty(name)
+    entries = _catalog_entries(db, _catalog_scope(user))
+    remaining = [e for e in entries if e["name"] != current]
+    if len(remaining) == len(entries):
+        if any(e["name"] == current for e in _effective_catalog(db, user)):
+            raise HTTPException(403, detail={"code": "GLOBAL_SPECIALTY", "message": "A national administrator manages this specialty"})
+        raise HTTPException(404, "Specialty not found")
+    _save_catalog(db, user, remaining)
+    return {"success": True, "data": {"name": current, "removed": True}, "meta": {}}
+
 @router.get("")
 def list_settings(db: Session = Depends(get_db), user=Depends(VIEW)):
     rows = db.query(Setting).order_by(Setting.key, Setting.scope).all()

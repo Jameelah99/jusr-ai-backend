@@ -148,7 +148,12 @@ def list_links(
     case = _case_for(db, user, case_id, modify=False)
     rows = (
         db.query(PatientLink)
-        .filter(PatientLink.case_id == case.id)
+        .filter(
+            PatientLink.case_id == case.id,
+            # Preview links are a staff-only window into the patient page; never
+            # present them as links that were sent to the patient.
+            PatientLink.delivery_channel.is_distinct_from("PREVIEW"),
+        )
         .order_by(PatientLink.created_at.desc())
         .all()
     )
@@ -172,6 +177,51 @@ def list_links(
             }
             for l in rows
         ],
+        "meta": {},
+    }
+
+
+@router.post("/{case_id}/preview-link")
+def preview_link(
+    case_id: str, db: Session = Depends(get_db), user=Depends(clinical_user)
+):
+    """Short-lived staff preview of the exact page the patient sees.
+
+    The token is handed to the requesting staff member only: it is never sent by
+    SMS, it is hidden from the case link list, and it expires after 30 minutes.
+    """
+    case = _case_for(db, user, case_id, modify=False)
+    patient = db.get(Patient, case.patient_id)
+    now = clock.now()
+    token = secrets.token_urlsafe(32)
+    link = PatientLink(
+        case_id=case.id,
+        patient_id=patient.id,
+        token_hash=hash_token(token),
+        created_by_id=user.id,
+        expires_at=now + timedelta(minutes=30),
+        delivery_channel="PREVIEW",
+        delivery_status="NOT_SENT",
+    )
+    db.add(link)
+    record_event(
+        db,
+        user,
+        case_id=case.id,
+        event_type="PATIENT_PREVIEW_OPENED",
+        description="Staff opened the patient view preview",
+        new_values={"linkId": link.id, "expiresAt": (now + timedelta(minutes=30)).isoformat()},
+    )
+    db.commit()
+    return {
+        "success": True,
+        "data": {
+            "token": token,
+            "path": f"/p/{token}",
+            "url": f"{settings.patient_link_base_url.rstrip('/')}/p/{token}",
+            "expiresAt": link.expires_at,
+            "note": "Preview only — no SMS was sent and patient actions are on this preview link.",
+        },
         "meta": {},
     }
 

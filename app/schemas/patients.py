@@ -27,3 +27,13 @@ class SimulationCaseCreate(BaseModel):
     confirmatoryRequired: bool | None = None
     nextActionLabel: str | None = Field(default=None, max_length=200)
     requiredSpecialty: str | None = Field(default=None, max_length=60)
+    initialStatus: Literal[
+        "AWAITING_CLASSIFICATION",
+        "NOTIFYING",
+        "AWAITING_ACK",
+        "AWAITING_CONFIRMATION",
+        "REFERRAL_PENDING",
+        "AWAITING_APPOINTMENT",
+        "AWAITING_TREATMENT",
+        "READY_TO_CLOSE",
+    ] | None = None
